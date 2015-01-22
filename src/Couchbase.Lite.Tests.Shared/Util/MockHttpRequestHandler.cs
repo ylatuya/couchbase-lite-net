@@ -63,16 +63,21 @@ namespace Couchbase.Lite.Tests
 
         #region Constructors
 
-        public MockHttpRequestHandler()
+        public MockHttpRequestHandler(bool defaultFail = true)
         {
             responders = new Dictionary<string, HttpResponseDelegate>();
             CapturedRequests = new List<HttpRequestMessage>();
-            AddDefaultResponders();
+            if(defaultFail)
+                AddDefaultResponders();
+
+            _defaultFail = defaultFail;
         }
 
         #endregion
 
         #region Instance Members
+
+        private bool _defaultFail;
 
         public Int32 ResponseDelayMilliseconds { get; set; }
 
@@ -80,7 +85,7 @@ namespace Couchbase.Lite.Tests
         {
             //var response = base.SendAsync(request, cancellationToken).Result;
 
-            Delay(); // FIXEM: Currently a no-op.
+            Delay(); // FIXME: Currently a no-op.
 
             capturedRequests.Add(request);
 
@@ -91,11 +96,17 @@ namespace Couchbase.Lite.Tests
                     var responder = responders[urlPattern];
                     var message = responder(request);
                     NotifyResponseListeners(request, message);
+                    if (message is RequestCorrectHttpMessage)
+                        return base.SendAsync(request, cancellationToken);
+
                     return Task.FromResult<HttpResponseMessage>(message);
                 }
             }
 
-            throw new Exception("No responders matched for url pattern: " + request.RequestUri.PathAndQuery);
+            if(_defaultFail)
+                throw new Exception("No responders matched for url pattern: " + request.RequestUri.PathAndQuery);
+
+            return base.SendAsync(request, cancellationToken);
         }
 
         public void SetResponder(string urlPattern, HttpResponseDelegate responder)

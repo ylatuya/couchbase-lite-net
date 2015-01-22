@@ -47,6 +47,7 @@ using System.Net;
 using System.Net.Http;
 using Couchbase.Lite.Support;
 using Couchbase.Lite.Util;
+using Couchbase.Lite.Replicator;
 
 namespace Couchbase.Lite.Tests
 {
@@ -66,14 +67,14 @@ namespace Couchbase.Lite.Tests
 
         public IDictionary<string, string> Headers { get; set; }
 
-        public MockHttpClientFactory() : this (null) { }
+        public MockHttpClientFactory(bool defaultFail = true) : this (null, defaultFail) { }
 
-        public MockHttpClientFactory(DirectoryInfo cookieStoreDirectory)
+        public MockHttpClientFactory(DirectoryInfo cookieStoreDirectory, bool defaultFail = true)
         {
             cookieStore = new CookieStore(cookieStore != null 
                 ? cookieStoreDirectory.FullName
                 : null);
-            HttpHandler = new MockHttpRequestHandler();
+            HttpHandler = new MockHttpRequestHandler(defaultFail);
             HttpHandler.CookieContainer = cookieStore;
             HttpHandler.UseCookies = true;
 
