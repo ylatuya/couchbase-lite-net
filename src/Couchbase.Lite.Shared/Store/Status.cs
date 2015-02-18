@@ -87,6 +87,8 @@ namespace Couchbase.Lite
 
         DbError = 590,
 
+        Exception = 594,
+
         DbBusy = 595
     }
 
