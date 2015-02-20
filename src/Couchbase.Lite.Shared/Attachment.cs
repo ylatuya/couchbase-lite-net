@@ -83,17 +83,17 @@ namespace Couchbase.Lite {
             Revision = revision;
             Name = name;
             Metadata = metadata;
-            Compressed = false;
         }
+
+        internal Attachment(string name, IDictionary<String, Object> metadata)
+        {
+            Name = name;
+            Metadata = metadata;
+        }
+
         #endregion
 
         #region Non-Public Instance Members
-
-        /// <summary>
-        /// Content stream is gzip encoded.
-        /// </summary>
-        /// <value><c>true</c> if compressed; otherwise, <c>false</c>.</value>
-        internal bool Compressed { get; set; }
 
         internal Stream Body { get; set; }
 
@@ -155,6 +155,8 @@ namespace Couchbase.Lite {
 
         #region Instance Members
 
+        internal Database Database { get; set; }
+
         /// <summary>
         /// Gets the owning <see cref="Couchbase.Lite.Revision"/>.
         /// </summary>
@@ -186,15 +188,6 @@ namespace Couchbase.Lite {
         /// <value>The content-type.</value>
         public String ContentType {
             get {
-//                Object contentType;
-//
-//                if (!Metadata.TryGetValue(AttachmentMetadataKeys.ContentType, out contentType))
-//                    throw new CouchbaseLiteException("Metadata must contain a key-value pair for {0}.", AttachmentMetadataKeys.ContentType);
-//
-//                if (!(contentType is String))
-//                    throw new CouchbaseLiteException("The {0} key in Metadata must contain a string value.", AttachmentMetadataKeys.ContentType);
-//
-//                return (String)contentType; 
                 return Metadata.Get(AttachmentMetadataKeys.ContentType) as String;
             }
         }
@@ -208,29 +201,8 @@ namespace Couchbase.Lite {
         /// </exception>
         public Stream ContentStream { 
             get {
-                if (Body != null) {
-                    Body.Reset();
-                    return Body;
-                }
-
-                if (Revision == null)
-                    throw new CouchbaseLiteException("Revision must not be null when retrieving attachment content");
-
-                if (Name == null)
-                    throw new CouchbaseLiteException("Name must not be null when retrieving attachment content");
-
-                var attachment = Revision.Database.GetAttachmentForSequence(
-                    Revision.Sequence,
-                    Name
-                    );
-
-                if (attachment == null)
-                    throw new CouchbaseLiteException("Could not retrieve an attachment for revision sequence {0}.", Revision.Sequence);
-
-                Body = attachment.ContentStream;
-                Body.Reset();
-
-                return Body;
+                BlobKey key = new BlobKey((string)Metadata[AttachmentMetadataKeys.Digest]);
+                return Database.Attachments.BlobStreamForKey(key);
             }
         }
 

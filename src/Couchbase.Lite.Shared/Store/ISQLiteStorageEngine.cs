@@ -50,6 +50,8 @@ namespace Couchbase.Lite.Storage
 {
     public interface ISQLiteStorageEngine
     {
+        bool InTransaction { get; }
+
         bool Open(String path);
 
         Int32 GetVersion();
@@ -58,9 +60,9 @@ namespace Couchbase.Lite.Storage
 
         bool IsOpen { get; }
 
-        void BeginTransaction();
+        int BeginTransaction();
 
-        void EndTransaction();
+        int EndTransaction();
 
         void SetTransactionSuccessful();
 

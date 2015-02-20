@@ -47,6 +47,7 @@ using Couchbase.Lite.Util;
 using Sharpen;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text;
 
 namespace Couchbase.Lite
 {

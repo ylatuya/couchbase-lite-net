@@ -52,7 +52,7 @@ using System.Linq;
 using SQLitePCL.Ugly;
 using Couchbase.Lite.Store;
 
-namespace Couchbase.Lite.Shared
+namespace Couchbase.Lite.Storage
 {
     internal sealed class SqlitePCLRawStorageEngine : ISQLiteStorageEngine, IDisposable
     {
@@ -79,10 +79,18 @@ namespace Couchbase.Lite.Shared
 
         #region implemented abstract members of SQLiteStorageEngine
 
+        public bool InTransaction
+        { 
+            get {
+                return transactionCount > 0;
+            }
+        }
+
         public bool Open(String path)
         {
-            if (IsOpen)
+            if(IsOpen) {
                 return true;
+            }
 
             Path = path;
             Factory = new TaskFactory(new SingleThreadScheduler());
@@ -126,6 +134,7 @@ namespace Couchbase.Lite.Shared
                     val = raw.sqlite3_compileoption_get(++i);
                 }
 #endif
+
             raw.sqlite3_create_collation(db, "JSON", null, CouchbaseSqliteJsonUnicodeCollationFunction.Compare);
             raw.sqlite3_create_collation(db, "JSON_ASCII", null, CouchbaseSqliteJsonAsciiCollationFunction.Compare);
             raw.sqlite3_create_collation(db, "JSON_RAW", null, CouchbaseSqliteJsonRawCollationFunction.Compare);
@@ -197,7 +206,7 @@ namespace Couchbase.Lite.Shared
 
         int transactionCount = 0;
 
-        public void BeginTransaction()
+        public int BeginTransaction()
         {
             if (!IsOpen)
             {
@@ -219,16 +228,18 @@ namespace Couchbase.Lite.Shared
                 });
                 t.Wait();
             }
+
+            return value;
         }
 
-        public void EndTransaction()
+        public int EndTransaction()
         {
             if (_writeConnection == null)
                 throw new InvalidOperationException("Database is not open.");
 
             var count = Interlocked.Decrement(ref transactionCount);
             if (count > 0)
-                return;
+                return count;
 
             /*if (_writeConnection == null)
             {
@@ -237,6 +248,7 @@ namespace Couchbase.Lite.Shared
                 return;
             }*/
 
+            var retVal = shouldCommit ? 0 : -1;
             var t = Factory.StartNew(() =>
             {
                 if (shouldCommit)
@@ -256,6 +268,8 @@ namespace Couchbase.Lite.Shared
                 }
             });
             t.Wait();
+
+            return retVal;
         }
 
         public void SetTransactionSuccessful()

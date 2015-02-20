@@ -79,6 +79,10 @@ namespace Couchbase.Lite
 
         BadJson = 493,
 
+        BadId = 494,
+
+        Deleted = 496,
+
         InternalServerError = 500,
 
         UpStreamError = 589,

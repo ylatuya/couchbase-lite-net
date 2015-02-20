@@ -221,6 +221,15 @@
     <Compile Include="$(MSBuildThisFileDirectory)Util\PrivateThreadSynchronizationContext.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Util\ArraySegment.cs" />
     <Compile Include="$(MSBuildThisFileDirectory)Replication\CouchbaseLiteHttpClient.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\ICouchStore.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\IStoreDelegate.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\IViewStorage.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\SymmetricKey.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\IViewStorageDelegate.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\IQueryRowStorage.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\SqliteViewStorage.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\SqliteStorage.cs" />
+    <Compile Include="$(MSBuildThisFileDirectory)Store\CouchStoreFactory.cs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="$(MSBuildThisFileDirectory)Store\MonoSQLiteStorageEngine.cs" />

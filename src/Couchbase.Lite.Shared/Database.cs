@@ -52,6 +52,7 @@ using Newtonsoft.Json.Linq;
 using Couchbase.Lite.Internal;
 using Couchbase.Lite.Replicator;
 using Couchbase.Lite.Storage;
+using Couchbase.Lite.Store;
 using Couchbase.Lite.Util;
 using Sharpen;
 using System.Collections.Concurrent;
@@ -66,7 +67,7 @@ namespace Couchbase.Lite
     /// <summary>
     /// A Couchbase Lite Database.
     /// </summary>
-    public sealed class Database 
+    public sealed class Database : IStoreDelegate
     {
     #region Constructors
 
@@ -75,13 +76,14 @@ namespace Couchbase.Lite
         /// </summary>
         /// <param name="path">Path.</param>
         /// <param name="manager">Manager.</param>
-        internal Database(String path, Manager manager)
+        internal Database(String path, Manager manager, bool readOnly = false)
         {
             Debug.Assert(System.IO.Path.IsPathRooted(path));
 
             //path must be absolute
             Path = path;
             Name = FileDirUtils.GetDatabaseNameFromPath(path);
+            _readOnly = readOnly;
             Manager = manager;
             DocumentCache = new LruCache<string, Document>(MaxDocCacheSize);
             UnsavedRevisionDocumentCache = new Dictionary<string, WeakReference>();
@@ -102,6 +104,7 @@ namespace Couchbase.Lite
     #endregion
 
     #region Static Members
+
         //Properties
 
         /// <summary>
@@ -140,6 +143,7 @@ namespace Couchbase.Lite
         //Properties
 
         private TaskFactory Scheduler { get; set; }
+        private bool _readOnly;
 
         public CookieContainer PersistentCookieStore
         {
@@ -152,6 +156,8 @@ namespace Couchbase.Lite
                 return _persistentCookieStore;
             }
         }
+
+        internal ICouchStore Store { get; private set; }
 
         /// <summary>
         /// Gets the <see cref="Couchbase.Lite.Database"/> name.
@@ -172,31 +178,8 @@ namespace Couchbase.Lite
         /// TODO: Convert this to a standard method call.
         public Int32 DocumentCount 
         {
-            get 
-            {
-                var sql = "SELECT COUNT(DISTINCT doc_id) FROM revs WHERE current=1 AND deleted=0";
-                Cursor cursor = null;
-                int result = 0;
-                try
-                {
-                    cursor = StorageEngine.RawQuery(sql);
-                    if (cursor.MoveToNext())
-                    {
-                        result = cursor.GetInt(0);
-                    }
-                }
-                catch (SQLException e)
-                {   // FIXME: Should we really swallow this exception?
-                    Log.E(Tag, "Error getting document count", e);
-                }
-                finally
-                {
-                    if (cursor != null)
-                    {
-                        cursor.Close();
-                    }
-                }
-                return result;
+            get  {
+                return Store.DocumentCount;
             }
         }
             
@@ -208,35 +191,8 @@ namespace Couchbase.Lite
         /// <value>The last sequence number.</value>
         public Int64 LastSequenceNumber 
         {
-            get
-            {
-                var sql = "SELECT MAX(sequence) FROM revs";
-                Cursor cursor = null;
-                long result = 0;
-                try
-                {
-                    cursor = StorageEngine.RawQuery(sql);
-                    if (cursor.MoveToNext())
-                    {
-                        result = cursor.GetLong(0);
-
-                        // When there is no rows in revs table, the result is -1 which is different
-                        // from the Android platform.
-                        if (result < 0) result = 0;
-                    }
-                }
-                catch (SQLException e)
-                {   // FIXME: Should we really swallow this exception?
-                    Log.E(Tag, "Error getting last sequence", e);
-                }
-                finally
-                {
-                    if (cursor != null)
-                    {
-                        cursor.Close();
-                    }
-                }
-                return result;
+            get {
+                return Store.LastSequence;
             }
         }
 
@@ -260,41 +216,8 @@ namespace Couchbase.Lite
         /// compacting the <see cref="Couchbase.Lite.Database" /></exception>
         public void Compact()
         {
-            // Can't delete any rows because that would lose revision tree history.
-            // But we can remove the JSON of non-current revisions, which is most of the space.
-            try
-            {
-                Log.V(Tag, "Deleting JSON of old revisions...");
-                PruneRevsToMaxDepth(0);
-                Log.V(Tag, "Deleting JSON of old revisions...");
-
-                var args = new ContentValues();
-                args["json"] = null;
-                StorageEngine.Update("revs", args, "current=0 AND json IS NOT NULL", null);
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error compacting", e);
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
-
-            Log.V(Tag, "Deleting old attachments...");
-            var result = GarbageCollectAttachments();
-            if (!result.IsSuccessful)
-            {
-                throw new CouchbaseLiteException(result.GetCode());
-            }
-
-            try
-            {
-                Log.V(Tag, "Vacuuming SQLite sqliteDb..." + result);
-                StorageEngine.ExecSQL("VACUUM");
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error vacuuming sqliteDb", e);
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
+            Store.Compact();
+            GarbageCollectAttachments();
         }
 
         /// <summary>
@@ -304,14 +227,12 @@ namespace Couchbase.Lite
         /// Thrown if an issue occurs while deleting the <see cref="Couchbase.Lite.Database" /></exception>
         public void Delete()
         {
-            if (_isOpen && !Close())
-            {
+            if(_isOpen && !Close()) {
                 throw new CouchbaseLiteException("The database was open, and could not be closed", StatusCode.InternalServerError);
             }
 
             Manager.ForgetDatabase(this);
-            if (!Exists())
-            {
+            if(!Exists()) {
                 return;
             }
 
@@ -320,8 +241,7 @@ namespace Couchbase.Lite
 
             var deleteStatus = file.Delete();
             
-            if (fileJournal.Exists())
-            {
+            if(fileJournal.Exists()) {
                 deleteStatus &= fileJournal.Delete();
             }
 
@@ -331,24 +251,20 @@ namespace Couchbase.Lite
 
             //recursively delete path where attachments stored( see getAttachmentStorePath())
             var lastDotPosition = Path.LastIndexOf('.');
-            if (lastDotPosition > 0)
-            {
+            if(lastDotPosition > 0) {
                 var attachmentsFileUpFolder = new FilePath(Path.Substring(0, lastDotPosition));
                 FileDirUtils.DeleteRecursive(attachmentsFileUpFolder);
             }
 
-            if (!deleteStatus)
-            {
+            if(!deleteStatus) {
                 Log.V(Tag, String.Format("Error deleting the SQLite database file at {0}", file.GetAbsolutePath()));
             }
 
-            if (!deleteStatus)
-            {
+            if(!deleteStatus) {
                 throw new CouchbaseLiteException("Was not able to delete the database file", StatusCode.InternalServerError);
             }
 
-            if (!deleteAttachmentStatus)
-            {
+            if(!deleteAttachmentStatus) {
                 throw new CouchbaseLiteException("Was not able to delete the attachments files", StatusCode.InternalServerError);
             }
         }
@@ -409,11 +325,11 @@ namespace Couchbase.Lite
         /// <param name="id">Identifier.</param>
         public IDictionary<String, Object> GetExistingLocalDocument(String id) 
         {
-            var revInt = GetLocalDocument(MakeLocalDocumentId(id), null);
-            if (revInt == null)
-            {
+            var revInt = Store.GetLocalDocument(MakeLocalDocumentId(id), null);
+            if(revInt == null) {
                 return null;
             }
+
             return revInt.GetProperties();
         }
 
@@ -429,36 +345,12 @@ namespace Couchbase.Lite
         { 
             // TODO: the iOS implementation wraps this in a transaction, this should do the same.
             id = MakeLocalDocumentId(id);
-            var prevRev = GetLocalDocument(id, null);
-
-            if (prevRev == null && properties == null)
-            {
-                return;
-            }
-
-            var deleted = false || properties == null;
-            var rev = new RevisionInternal(id, null, deleted);
-
-            if (properties != null)
-            {
+            RevisionInternal rev = new RevisionInternal(id, null, properties == null);
+            if(properties != null) {
                 rev.SetProperties(properties);
             }
 
-            var success = false;
-
-            if (prevRev == null)
-            {
-                success = PutLocalRevision(rev, null) != null;
-            }
-            else
-            {
-                success = PutLocalRevision(rev, prevRev.GetRevId()) != null;
-            }
-
-            if (!success) 
-            {
-                throw new CouchbaseLiteException("Unable to put local revision with id " + id);
-            }
+            Store.PutLocalRevision(rev, null, false);
         }
 
         /// <summary>
@@ -469,24 +361,7 @@ namespace Couchbase.Lite
         /// <exception cref="Couchbase.Lite.CouchbaseLiteException">Thrown if there is an issue occurs while deleting the local document.</exception>
         public Boolean DeleteLocalDocument(String id) 
         {
-            id = MakeLocalDocumentId(id);
-
-            var prevRev = GetLocalDocument(id, null);
-            if (prevRev == null)
-            {
-                return false;
-            }
-
-            try 
-            {
-                DeleteLocalDocument(id, prevRev.GetRevId());
-            }
-            catch (Exception ex)
-            {
-                Log.D(Tag, "Cannot delete a local document id {0}\r\n{1}", id, ex);
-                return false;
-            }
-
+            PutLocalDocument(id, null);
             return true;
         } 
 
@@ -497,6 +372,34 @@ namespace Couchbase.Lite
         public Query CreateAllDocumentsQuery() 
         {
             return new Query(this, (View)null);
+        }
+
+        internal View MakeAnonymousView()
+        {
+            for (var i = 0; true; ++i)
+            {
+                var name = String.Format("anon{0}", i);
+                var existing = GetExistingView(name);
+                if (existing == null)
+                {
+                    // this name has not been used yet, so let's use it
+                    return GetView(name);
+                }
+            }
+        }
+
+        internal View RegisterView(View view)
+        {
+            if(view == null) {
+                return null;
+            }
+
+            if(_views == null) {
+                _views = new Dictionary<string, View>();
+            }
+
+            _views[view.Name] = view;
+            return view;
         }
 
         /// <summary>
@@ -542,6 +445,69 @@ namespace Couchbase.Lite
             view = new View(this, name);
 
             return view.Id == 0 ? null : RegisterView(view);
+        }
+
+        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
+        internal IEnumerable<QueryRow> QueryViewNamed(String viewName, QueryOptions options, IList<Int64> outLastSequence)
+        {
+            Log.D(Tag, "Starting QueryViewNamed");
+            var before = Runtime.CurrentTimeMillis();
+            var lastSequence = 0L;
+            IEnumerable<QueryRow> rows;
+
+            if (!String.IsNullOrEmpty (viewName)) {
+                var view = GetView (viewName);
+                if (view == null)
+                {
+                    throw new CouchbaseLiteException (StatusCode.NotFound);
+                }
+
+                lastSequence = view.LastSequenceIndexed;
+                if (options.GetStale () == IndexUpdateMode.Before || lastSequence <= 0) {
+                    Log.D(Tag, "Updating index on view '{0}' before generating query results.", view.Name);
+                    view.UpdateIndex ();
+                    lastSequence = view.LastSequenceIndexed;
+                } else {
+                    if (options.GetStale () == IndexUpdateMode.After 
+                        && lastSequence < this.LastSequenceNumber)
+                    {
+                        Log.D(Tag, "Deferring index update on view '{0}'.", view.Name);
+                        RunAsync((db)=>
+                        {
+                            try
+                            {
+                                Log.D(Tag, "Updating index on view '{0}'", view.Name);
+                                view.UpdateIndex();
+                            }
+                            catch (CouchbaseLiteException e)
+                            {
+                                Log.E(Tag, "Error updating view index on background thread", e);
+                            }
+                        });
+                    }
+                }
+                rows = view.QueryWithOptions (options);
+            } else {
+                // nil view means query _all_docs
+                // note: this is a little kludgy, but we have to pull out the "rows" field from the
+                // result dictionary because that's what we want.  should be refactored, but
+                // it's a little tricky, so postponing.
+                Log.D(Tag, "Returning an all docs query.");
+                var allDocsResult = GetAllDocs (options);
+                rows = (IList<QueryRow>)allDocsResult.Get ("rows");
+                lastSequence = this.LastSequenceNumber;
+            }
+            outLastSequence.AddItem(lastSequence);
+
+            var delta = Runtime.CurrentTimeMillis() - before;
+            Log.D(Tag, String.Format("Query view {0} completed in {1} milliseconds", viewName, delta));
+
+            return rows;
+        }
+
+        internal void SetLastSequence(string lastSequence, string checkpointID)
+        {
+            this.Store.SetInfo("checkpoint/" + checkpointID, lastSequence);
         }
 
         /// <summary>
@@ -664,50 +630,12 @@ namespace Couchbase.Lite
         /// <param name="transactionDelegate">The delegate to run within a transaction.</param>
         public Boolean RunInTransaction(RunInTransactionDelegate transactionDelegate)
         {
-            var transactionTask = Scheduler.StartNew(() =>
+            Status status = Store.RunInTransaction(() =>
             {
-                var shouldCommit = true;
-
-                BeginTransaction();
-
-                try
-                {
-                    Log.V(Tag, "Tx delegate starting");
-                    shouldCommit = transactionDelegate();
-                }
-                catch (Exception e)
-                {
-                    shouldCommit = false;
-                    Log.E(Tag, e.ToString(), e);
-                    throw;
-                }
-                finally
-                {
-                    Log.V(Tag, "Tx delegate done: {0}", shouldCommit);
-                    EndTransaction(shouldCommit);
-                }
-
-                Log.V(Tag, "Tx delegate complete: {0}", shouldCommit);
-                return shouldCommit;
+                return transactionDelegate() ? new Status(StatusCode.Ok) : new Status(StatusCode.DbError);
             });
 
-            var result = false;
-
-            try
-            {
-                result = transactionTask.Result;
-            }
-            catch (AggregateException ex)
-            {
-                throw ex.InnerException;
-            }
-
-            Log.V(Tag, "Tx complete: {0}", result);
-
-            if (transactionTask.Status != TaskStatus.RanToCompletion)
-                throw new CouchbaseLiteException("Database transaction timed out.", StatusCode.InternalServerError);
-  
-            return result;
+            return status.IsSuccessful;
         }
 
             
@@ -841,7 +769,6 @@ PRAGMA user_version = 3;";
         internal String                                 Path { get; private set; }
         internal IList<Replication>                     ActiveReplicators { get; set; }
         internal IList<Replication>                     AllReplicators { get; set; }
-        internal ISQLiteStorageEngine                   StorageEngine { get; set; }
         internal LruCache<String, Document>             DocumentCache { get; set; }
         internal IDictionary<String, WeakReference>     UnsavedRevisionDocumentCache { get; set; }
 
@@ -861,63 +788,6 @@ PRAGMA user_version = 3;";
 
         private Int64                                   StartTime { get; set; }
         private IDictionary<String, FilterDelegate>     Filters { get; set; }
-
-        internal RevisionList GetAllRevisionsOfDocumentID (string id, bool onlyCurrent)
-        {
-            var docNumericId = GetDocNumericID(id);
-            if (docNumericId < 0)
-            {
-                return null;
-            }
-            else
-            {
-                if (docNumericId == 0)
-                {
-                    return new RevisionList();
-                }
-                else
-                {
-                    return GetAllRevisionsOfDocumentID(id, docNumericId, onlyCurrent);
-                }
-            }
-        }
-
-        private RevisionList GetAllRevisionsOfDocumentID(string docId, long docNumericID, bool onlyCurrent)
-        {
-            var sql = onlyCurrent 
-                ? "SELECT sequence, revid, deleted FROM revs " + "WHERE doc_id=? AND current ORDER BY sequence DESC"
-                : "SELECT sequence, revid, deleted FROM revs " + "WHERE doc_id=? ORDER BY sequence DESC";
-
-            var args = new [] { Convert.ToString (docNumericID) };
-            var cursor = StorageEngine.RawQuery(sql, args);
-
-            RevisionList result;
-            try
-            {
-                cursor.MoveToNext();
-                result = new RevisionList();
-                while (!cursor.IsAfterLast())
-                {
-                    var rev = new RevisionInternal(docId, cursor.GetString(1), (cursor.GetInt(2) > 0));
-                    rev.SetSequence(cursor.GetLong(0));
-                    result.AddItem(rev);
-                    cursor.MoveToNext();
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting all revisions of document", e);
-                return null;
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
 
         private String GetDesignDocFunction(String fnName, String key, ICollection<String> outLanguageList)
         {
@@ -958,444 +828,24 @@ PRAGMA user_version = 3;";
             return string.Format("_local/{0}", documentId);
         }
 
-        internal RevisionInternal PutLocalRevision(RevisionInternal revision, string prevRevID)
-        {
-            var docID = revision.GetDocId();
-            if (!docID.StartsWith ("_local/", StringComparison.InvariantCultureIgnoreCase))
-            {
-                throw new CouchbaseLiteException(StatusCode.BadRequest);
-            }
-
-            if (!revision.IsDeleted())
-            {
-                // PUT:
-                string newRevID;
-                var json = EncodeDocumentJSON(revision);
-
-                if (prevRevID != null)
-                {
-                    var generation = RevisionInternal.GenerationFromRevID(prevRevID);
-                    if (generation == 0)
-                    {
-                        throw new CouchbaseLiteException(StatusCode.BadRequest);
-                    }
-                    newRevID = Sharpen.Extensions.ToString(++generation) + "-local";
-
-                    var values = new ContentValues();
-                    values["revid"] = newRevID;
-                    values["json"] = json;
-
-                    var whereArgs = new [] { docID, prevRevID };
-                    try
-                    {
-                        var rowsUpdated = StorageEngine.Update("localdocs", values, "docid=? AND revid=?", whereArgs);
-                        if (rowsUpdated == 0)
-                        {
-                            throw new CouchbaseLiteException(StatusCode.Conflict);
-                        }
-                    }
-                    catch (SQLException e)
-                    {
-                        throw new CouchbaseLiteException(e, StatusCode.InternalServerError);
-                    }
-                }
-                else
-                {
-                    newRevID = "1-local";
-
-                    var values = new ContentValues();
-                    values["docid"] = docID;
-                    values["revid"] = newRevID;
-                    values["json"] = json;
-
-                    try
-                    {
-                        StorageEngine.InsertWithOnConflict("localdocs", null, values, ConflictResolutionStrategy.Ignore);
-                    }
-                    catch (SQLException e)
-                    {
-                        throw new CouchbaseLiteException(e, StatusCode.InternalServerError);
-                    }
-                }
-                return revision.CopyWithDocID(docID, newRevID);
-            }
-            else
-            {
-                // DELETE:
-                DeleteLocalDocument(docID, prevRevID);
-                return revision;
-            }
-        }
-
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void DeleteLocalDocument(string docID, string revID)
-        {
-            if (docID == null)
-            {
-                throw new CouchbaseLiteException(StatusCode.BadRequest);
-            }
-
-            if (revID == null)
-            {
-                // Didn't specify a revision to delete: 404 or a 409, depending
-                if (GetLocalDocument(docID, null) != null)
-                {
-                    throw new CouchbaseLiteException(StatusCode.Conflict);
-                }
-                else
-                {
-                    throw new CouchbaseLiteException(StatusCode.NotFound);
-                }
-            }
-
-            var whereArgs = new [] { docID, revID };
-            try
-            {
-                int rowsDeleted = StorageEngine.Delete("localdocs", "docid=? AND revid=?", whereArgs);
-                if (rowsDeleted == 0)
-                {
-                    if (GetLocalDocument(docID, null) != null)
-                    {
-                        throw new CouchbaseLiteException(StatusCode.Conflict);
-                    }
-                    else
-                    {
-                        throw new CouchbaseLiteException(StatusCode.NotFound);
-                    }
-                }
-            }
-            catch (SQLException e)
-            {
-                throw new CouchbaseLiteException(e, StatusCode.InternalServerError);
-            }
-        }
-
-        internal RevisionInternal GetLocalDocument(string docID, string revID)
-        {
-            // docID already should contain "_local/" prefix
-            RevisionInternal result = null;
-            Cursor cursor = null;
-            try
-            {
-                var args = new [] { docID };
-                cursor = StorageEngine.RawQuery("SELECT revid, json FROM localdocs WHERE docid=?", args);
-
-                if (cursor.MoveToNext())
-                {
-                    var gotRevID = cursor.GetString(0);
-                    if (revID != null && (!revID.Equals(gotRevID)))
-                    {
-                        return null;
-                    }
-
-                    var json = cursor.GetBlob(1);
-                    IDictionary<string, object> properties = null;
-                    try
-                    {
-                        properties = Manager.GetObjectMapper().ReadValue<IDictionary<String, Object>>(json);
-                        properties["_id"] = docID;
-                        properties["_rev"] = gotRevID;
-
-                        result = new RevisionInternal(docID, gotRevID, false);
-                        result.SetProperties(properties);
-                    }
-                    catch (Exception e)
-                    {
-                        Log.W(Tag, "Error parsing local doc JSON", e);
-                        return null;
-                    }
-                }
-                return result;
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting local document", e);
-                return null;
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-        }
-
-        /// <summary>Inserts an already-existing revision replicated from a remote sqliteDb.</summary>
-        /// <remarks>
-        /// Inserts an already-existing revision replicated from a remote sqliteDb.
-        /// It must already have a revision ID. This may create a conflict! The revision's history must be given; ancestor revision IDs that don't already exist locally will create phantom revisions with no content.
-        /// </remarks>
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void ForceInsert(RevisionInternal rev, IList<string> revHistory, Uri source)
-        {
-            var inConflict = false;
-            var docId = rev.GetDocId();
-            var revId = rev.GetRevId();
-
-            if (!IsValidDocumentId(docId) || (revId == null))
-            {
-                throw new CouchbaseLiteException(StatusCode.BadRequest);
-            }
-
-            int historyCount = 0;
-
-            if (revHistory != null)
-            {
-                historyCount = revHistory.Count;
-            }
-
-            if (historyCount == 0)
-            {
-                revHistory = new List<string>();
-                revHistory.AddItem(revId);
-                historyCount = 1;
-            }
-            else
-            {
-                if (!revHistory[0].Equals(rev.GetRevId()))
-                {
-                    throw new CouchbaseLiteException(StatusCode.BadRequest);
-                }
-            }
-
-            RunInTransaction(() =>
-            {
-                try
-                {
-                    // First look up all locally-known revisions of this document:
-                    long docNumericID = GetOrInsertDocNumericID(docId);
-
-                    RevisionList localRevs = GetAllRevisionsOfDocumentID(docId, docNumericID, false);
-
-                    if (localRevs == null)
-                    {
-                        throw new CouchbaseLiteException(StatusCode.InternalServerError);
-                    }
-
-                    IList<bool> outIsDeleted = new List<bool>();
-                    IList<bool> outIsConflict = new List<bool>();
-
-                    bool oldWinnerWasDeletion = false;
-                    string oldWinningRevID = WinningRevIDOfDoc(docNumericID, outIsDeleted, outIsConflict
-                                         );
-                    if (outIsDeleted.Count > 0)
-                    {
-                        oldWinnerWasDeletion = true;
-                    }
-                    if (outIsConflict.Count > 0)
-                    {
-                        inConflict = true;
-                    }
-
-                    // Walk through the remote history in chronological order, matching each revision ID to
-                    // a local revision. When the list diverges, start creating blank local revisions to fill
-                    // in the local history:
-                    long sequence = 0;
-                    long localParentSequence = 0;
-
-                    for (int i = revHistory.Count - 1; i >= 0; --i)
-                    {
-                        revId = revHistory[i];
-                        RevisionInternal localRev = localRevs.RevWithDocIdAndRevId(docId, revId);
-
-                        if (localRev != null)
-                        {
-                            // This revision is known locally. Remember its sequence as the parent of the next one:
-                            sequence = localRev.GetSequence();
-                            Debug.Assert((sequence > 0));
-                            localParentSequence = sequence;
-                        }
-                        else
-                        {
-                            // This revision isn't known, so add it:
-                            RevisionInternal newRev;
-                            IEnumerable<Byte> data = null;
-                            bool current = false;
-
-                            if (i == 0)
-                            {
-                                // Hey, this is the leaf revision we're inserting:
-                                newRev = rev;
-                                if (!rev.IsDeleted())
-                                {
-                                    data = EncodeDocumentJSON(rev);
-                                    if (data == null)
-                                    {
-                                        throw new CouchbaseLiteException(StatusCode.BadRequest);
-                                    }
-                                }
-                                current = true;
-                            }
-                            else
-                            {
-                                // It's an intermediate parent, so insert a stub:
-                                newRev = new RevisionInternal(docId, revId, false);
-                            }
-
-                            // Insert it:
-                            sequence = InsertRevision(newRev, docNumericID, sequence, current, (GetAttachmentsFromRevision(newRev).Count > 0), data);
-
-                            if (sequence <= 0)
-                            {
-                                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-                            }
-
-                            if (i == 0)
-                            {
-                                // Write any changed attachments for the new revision. As the parent sequence use
-                                // the latest local revision (this is to copy attachments from):
-                                var attachments = GetAttachmentsFromRevision(rev);
-
-                                if (attachments != null)
-                                {
-                                    ProcessAttachmentsForRevision(attachments, rev, localParentSequence);
-                                    StubOutAttachmentsInRevision(attachments, rev);
-                                }
-                            }
-                        }
-                    }
-
-                    // Mark the latest local rev as no longer current:
-                    if (localParentSequence > 0 && localParentSequence != sequence)
-                    {
-                        ContentValues args = new ContentValues();
-                        args["current"] = 0;
-                        string[] whereArgs = new string[] { Convert.ToString(localParentSequence) };
-
-                        try
-                        {
-                            var numRowsChanged = StorageEngine.Update("revs", args, "sequence=?", whereArgs);
-
-                            if (numRowsChanged == 0)
-                            {
-                                inConflict = true;
-                            }
-                        }
-                        catch (Exception)
-                        {
-                            throw new CouchbaseLiteException(StatusCode.InternalServerError);
-                        }
-                    }
-
-                    var winningRev = Winner(docNumericID, oldWinningRevID, oldWinnerWasDeletion, rev);
-                    NotifyChange(rev, winningRev, source, inConflict);
-                    return true;
-                }
-                catch (SQLException)
-                {
-                    throw new CouchbaseLiteException(StatusCode.InternalServerError);
-                }
-            });
-        }
-
-        private Int64 GetOrInsertDocNumericID(String docId)
-        {
-            Int64 docNumericId = -1L;
-            RunInTransaction(() =>
-            {
-                docNumericId = GetDocNumericID(docId);
-                if (docNumericId == 0)
-                {
-                    docNumericId = InsertDocumentID(docId);
-                }
-
-                return true;
-            });
-
-            return docNumericId;
-        }
-
         /// <summary>Deletes obsolete attachments from the sqliteDb and blob store.</summary>
-        private Status GarbageCollectAttachments()
+        private bool GarbageCollectAttachments()
         {
-            // First delete attachment rows for already-cleared revisions:
-            // OPT: Could start after last sequence# we GC'd up to
-            try
-            {
-                StorageEngine.ExecSQL("DELETE FROM attachments WHERE sequence IN (SELECT sequence from revs WHERE json IS null)");
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error deleting attachments", e);
+            var keys = Store.FindAllAttachmentKeys();
+            if(keys == null) {
+                return false;
             }
 
-            // Now collect all remaining attachment IDs and tell the store to delete all but these:
-            Cursor cursor = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT DISTINCT key FROM attachments");
-                cursor.MoveToNext();
+            Log.D(Tag, "Found {0} attachments...", keys.Count);
+            var deleted = Attachments.DeleteBlobsExceptWithKeys(keys);
+            Log.D(Tag, "...deleted {0} obsolete attachment files.", deleted);
 
-                var allKeys = new List<BlobKey>();
-                while (!cursor.IsAfterLast())
-                {
-                    var key = new BlobKey(cursor.GetBlob(0));
-                    allKeys.AddItem(key);
-                    cursor.MoveToNext();
-                }
-
-                var numDeleted = Attachments.DeleteBlobsExceptWithKeys(allKeys);
-                if (numDeleted < 0)
-                {
-                    return new Status(StatusCode.InternalServerError);
-                }
-
-                Log.V(Tag, "Deleted " + numDeleted + " attachments");
-
-                return new Status(StatusCode.Ok);
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error finding attachment keys in use", e);
-                return new Status(StatusCode.InternalServerError);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-        }
-
-        internal Boolean SetLastSequence(String lastSequence, String checkpointId, Boolean push)
-        {
-            var values = new ContentValues();
-            values.Put("remote", checkpointId);
-            values["push"] = push;
-            values["last_sequence"] = lastSequence;
-            var newId = StorageEngine.InsertWithOnConflict("replicators", null, values, ConflictResolutionStrategy.Replace);
-            Log.D(Tag, "Set Last Sequence: {0}: {1} / {2}".Fmt(lastSequence, checkpointId, newId));
-            return (newId == -1);
+            return deleted >= 0;
         }
 
         internal String LastSequenceWithCheckpointId(string checkpointId)
         {
-            Cursor cursor = null;
-            string result = null;
-            try
-            {
-                var args = new [] { checkpointId };
-                cursor = StorageEngine.RawQuery("SELECT last_sequence FROM replicators WHERE remote=?", args);
-                if (cursor.MoveToNext())
-                {
-                    result = cursor.GetString(0);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting last sequence", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            Log.D(Tag, "LastSequenceWithCheckpointId: {1} -> {0}".Fmt(result, checkpointId));
-            return result;
+            return Store.GetInfo(String.Format("checkpoint/{0}", checkpointId));
         }
 
         private IDictionary<String, BlobStoreWriter> PendingAttachmentsByDigest
@@ -1407,145 +857,15 @@ PRAGMA user_version = 3;";
                 _pendingAttachmentsByDigest = value;
             }
         }
-
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal IEnumerable<QueryRow> QueryViewNamed(String viewName, QueryOptions options, IList<Int64> outLastSequence)
-        {
-            Log.D(Tag, "Starting QueryViewNamed");
-            var before = Runtime.CurrentTimeMillis();
-            var lastSequence = 0L;
-            IEnumerable<QueryRow> rows;
-
-            if (!String.IsNullOrEmpty (viewName)) {
-                var view = GetView (viewName);
-                if (view == null)
-                {
-                    throw new CouchbaseLiteException (StatusCode.NotFound);
-                }
-                    
-                lastSequence = view.LastSequenceIndexed;
-                if (options.GetStale () == IndexUpdateMode.Before || lastSequence <= 0) {
-                    Log.D(Tag, "Updating index on view '{0}' before generating query results.", view.Name);
-                    view.UpdateIndex ();
-                    lastSequence = view.LastSequenceIndexed;
-                } else {
-                    if (options.GetStale () == IndexUpdateMode.After 
-                        && lastSequence < GetLastSequenceNumber())
-                    {
-                        Log.D(Tag, "Deferring index update on view '{0}'.", view.Name);
-                        RunAsync((db)=>
-                        {
-                            try
-                            {
-                                Log.D(Tag, "Updating index on view '{0}'", view.Name);
-                                view.UpdateIndex();
-                            }
-                            catch (CouchbaseLiteException e)
-                            {
-                                Log.E(Tag, "Error updating view index on background thread", e);
-                            }
-                        });
-                    }
-                }
-                rows = view.QueryWithOptions (options);
-            } else {
-                // nil view means query _all_docs
-                // note: this is a little kludgy, but we have to pull out the "rows" field from the
-                // result dictionary because that's what we want.  should be refactored, but
-                // it's a little tricky, so postponing.
-                Log.D(Tag, "Returning an all docs query.");
-                var allDocsResult = GetAllDocs (options);
-                rows = (IList<QueryRow>)allDocsResult.Get ("rows");
-                lastSequence = GetLastSequenceNumber ();
-            }
-            outLastSequence.AddItem(lastSequence);
-
-            var delta = Runtime.CurrentTimeMillis() - before;
-            Log.D(Tag, String.Format("Query view {0} completed in {1} milliseconds", viewName, delta));
-
-            return rows;
-        }
-
+            
         internal RevisionList ChangesSince(long lastSeq, ChangesOptions options, FilterDelegate filter)
         {
-            // http://wiki.apache.org/couchdb/HTTP_database_API#Changes
-            if (options == null)
-            {
-                options = new ChangesOptions();
+            RevisionFilterDelegate revFilter = null;
+            if(filter != null) {
+                revFilter = (rev) => RunFilter(filter, null, rev);
             }
 
-            var includeDocs = options.IsIncludeDocs() || (filter != null);
-            var additionalSelectColumns = string.Empty;
-
-            if (includeDocs)
-            {
-                additionalSelectColumns = ", json";
-            }
-
-            var sql = "SELECT sequence, revs.doc_id, docid, revid, deleted" + additionalSelectColumns
-                      + " FROM revs, docs " + "WHERE sequence > ? AND current=1 " + "AND revs.doc_id = docs.doc_id "
-                      + "ORDER BY revs.doc_id, revid DESC";
-            var args = lastSeq;
-
-            Cursor cursor = null;
-            RevisionList changes = null;
-
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql, args);
-                cursor.MoveToNext();
-
-                changes = new RevisionList();
-                long lastDocId = 0;
-
-                while (!cursor.IsAfterLast())
-                {
-                    if (!options.IsIncludeConflicts())
-                    {
-                        // Only count the first rev for a given doc (the rest will be losing conflicts):
-                        var docNumericId = cursor.GetLong(1);
-                        if (docNumericId == lastDocId)
-                        {
-                            cursor.MoveToNext();
-                            continue;
-                        }
-                        lastDocId = docNumericId;
-                    }
-
-                    var sequence = cursor.GetLong(0);
-                    var rev = new RevisionInternal(cursor.GetString(2), cursor.GetString(3), (cursor.GetInt(4) > 0));
-                    rev.SetSequence(sequence);
-
-                    if (includeDocs)
-                    {
-                        ExpandStoredJSONIntoRevisionWithAttachments(cursor.GetBlob(5), rev, options.GetContentOptions());
-                    }
-                    IDictionary<string, object> paramsFixMe = null;
-                    // TODO: these should not be null
-                    if (RunFilter(filter, paramsFixMe, rev))
-                    {
-                        changes.AddItem(rev);
-                    }
-                    cursor.MoveToNext();
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error looking for changes", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            if (options.IsSortBySequence())
-            {
-                changes.SortBySequence();
-            }
-            changes.Limit(options.GetLimit());
-            return changes;
+            return Store.ChangesSince(lastSeq, options, revFilter);
         }
 
         internal bool RunFilter(FilterDelegate filter, IDictionary<string, object> paramsIgnored, RevisionInternal rev)
@@ -1561,413 +881,7 @@ PRAGMA user_version = 3;";
         /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
         internal IDictionary<String, Object> GetAllDocs(QueryOptions options)
         {
-            var result = new Dictionary<String, Object>();
-            var rows = new List<QueryRow>();
-            if (options == null)
-                options = new QueryOptions();
-
-            var includeDeletedDocs = (options.GetAllDocsMode() == AllDocsMode.IncludeDeleted);
-            var updateSeq = 0L;
-            if (options.IsUpdateSeq())
-            {
-                updateSeq = GetLastSequenceNumber();
-            }
-
-            // TODO: needs to be atomic with the following SELECT
-            var sql = new StringBuilder("SELECT revs.doc_id, docid, revid, sequence");
-            if (options.IsIncludeDocs())
-            {
-                sql.Append(", json");
-            }
-            if (includeDeletedDocs)
-            {
-                sql.Append(", deleted");
-            }
-            sql.Append(" FROM revs, docs WHERE");
-
-            if (options.GetKeys() != null)
-            {
-                if (options.GetKeys().Count() == 0)
-                {
-                    return result;
-                }
-                var commaSeperatedIds = JoinQuotedObjects(options.GetKeys());
-                sql.Append(String.Format(" revs.doc_id IN (SELECT doc_id FROM docs WHERE docid IN ({0})) AND", commaSeperatedIds));
-            }
-            sql.Append(" docs.doc_id = revs.doc_id AND current=1");
-
-            if (!includeDeletedDocs)
-            {
-                sql.Append(" AND deleted=0");
-            }
-
-            var args = new List<String>();
-            var minKey = options.GetStartKey();
-            var maxKey = options.GetEndKey();
-            var inclusiveMin = true;
-            var inclusiveMax = options.IsInclusiveEnd();
-
-            if (options.IsDescending())
-            {
-                minKey = maxKey;
-                maxKey = options.GetStartKey();
-                inclusiveMin = inclusiveMax;
-                inclusiveMax = true;
-            }
-            if (minKey != null)
-            {
-                Debug.Assert((minKey is String));
-                sql.Append((inclusiveMin ? " AND docid >= ?" : " AND docid > ?"));
-                args.AddItem((string)minKey);
-            }
-            if (maxKey != null)
-            {
-                Debug.Assert((maxKey is string));
-                sql.Append((inclusiveMax ? " AND docid <= ?" : " AND docid < ?"));
-                args.AddItem((string)maxKey);
-            }
-            sql.Append(
-                String.Format(" ORDER BY docid {0}, {1} revid DESC LIMIT ? OFFSET ?", 
-                    options.IsDescending() ? "DESC" : "ASC", 
-                    includeDeletedDocs ? "deleted ASC," : String.Empty
-                )
-            );
-            args.AddItem(options.GetLimit().ToString());
-            args.AddItem(options.GetSkip().ToString());
-
-            Cursor cursor = null;
-            var docs = new Dictionary<String, QueryRow>();
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql.ToString(), args.ToArray());
-
-//                cursor.MoveToNext();
-
-                var keepGoing = cursor.MoveToNext();
-                while (keepGoing)
-                {
-                    var docNumericID = cursor.GetLong(0);
-
-                    var includeDocs = options.IsIncludeDocs();
-
-                    var docId = cursor.GetString(1);
-                    var revId = cursor.GetString(2);
-                    var sequenceNumber = cursor.GetLong(3);
-                    byte[] json = null;
-                    if (includeDocs)
-                    {
-                        json = cursor.GetBlob(4);
-                    }
-                    var deleted = includeDeletedDocs && cursor.GetInt(GetDeletedColumnIndex(options)) > 0;
-
-                    IDictionary<String, Object> docContents = null;
-
-                    if (includeDocs)
-                    {
-                        docContents = DocumentPropertiesFromJSON(json, docId, revId, deleted, sequenceNumber, options.GetContentOptions());
-                    }
-                    // Iterate over following rows with the same doc_id -- these are conflicts.
-                    // Skip them, but collect their revIDs if the 'conflicts' option is set:
-                    var conflicts = new List<string>();
-                    while (((keepGoing = cursor.MoveToNext())) && cursor.GetLong(0) == docNumericID)
-                    {
-                       if (options.GetAllDocsMode() == AllDocsMode.ShowConflicts || options.GetAllDocsMode() == AllDocsMode.OnlyConflicts)
-                       {
-                           if (conflicts.IsEmpty())
-                           {
-                               conflicts.AddItem(revId);
-                           }
-                           conflicts.AddItem(cursor.GetString(2));
-                       }
-                    }
-                    if (options.GetAllDocsMode() == AllDocsMode.OnlyConflicts && conflicts.IsEmpty())
-                    {
-                       continue;
-                    }
-                    var value = new Dictionary<string, object>();
-                    value["rev"] = revId;
-                    value["_conflicts"] = conflicts;
-                    if (includeDeletedDocs)
-                    {
-                        value["deleted"] = deleted;
-                    }
-                    var change = new QueryRow(docId, sequenceNumber, docId, value, docContents);
-                    change.Database = this;
-
-                    if (options.GetKeys() != null)
-                    {
-                        docs[docId] = change;
-                    }
-                    else
-                    {
-                        rows.AddItem(change);
-                    }
-                }
-                if (options.GetKeys() != null)
-                {
-                    foreach (var docIdObject in options.GetKeys())
-                    {
-                        if (docIdObject is string)
-                        {
-                            var docId = (string)docIdObject;
-                            var change = docs.Get(docId);
-                            if (change == null)
-                            {
-                                var value = new Dictionary<string, object>();
-                                var docNumericID = GetDocNumericID(docId);
-                                if (docNumericID > 0)
-                                {
-                                    bool deleted;
-                                    var outIsDeleted = new List<bool>();
-                                    var outIsConflict = new List<bool>();
-                                    var revId = WinningRevIDOfDoc(docNumericID, outIsDeleted, outIsConflict, true);
-                                    if (outIsDeleted.Count > 0)
-                                    {
-                                        deleted = true;
-                                    }
-                                    if (revId != null)
-                                    {
-                                        value["rev"] = revId;
-                                        value["deleted"] = true; // FIXME: SHould this be set the value of `deleted`?
-                                    }
-                                }
-                                change = new QueryRow((value != null ? docId : null), 0, docId, value, null);
-                                change.Database = this;
-                            }
-                            rows.AddItem(change);
-                        }
-                    }
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting all docs", e);
-                throw new CouchbaseLiteException("Error getting all docs", e, new Status(StatusCode.InternalServerError));
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close ();
-                }
-            }
-            result["rows"] = rows;
-            result["total_rows"] = rows.Count;
-            result.Put("offset", options.GetSkip());
-            if (updateSeq != 0)
-            {
-                result["update_seq"] = updateSeq;
-            }
-            return result;
-        }
-
-        /// <summary>Returns the rev ID of the 'winning' revision of this document, and whether it's deleted.</summary>
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal String WinningRevIDOfDoc(Int64 docNumericId, IList<Boolean> outIsDeleted, IList<Boolean> outIsConflict, Boolean readOnly = false)
-        {
-            Cursor cursor = null;
-            var args = new [] { Convert.ToString(docNumericId) };
-            String revId = null;
-            var sql = "SELECT revid, deleted FROM revs WHERE doc_id=? and current=1" 
-                      + " ORDER BY deleted asc, revid desc LIMIT 2";
-
-            try
-            {
-                cursor = readOnly 
-                    ? StorageEngine.RawQuery(sql, args)
-                    : StorageEngine.IntransactionRawQuery(sql, args);
-                cursor.MoveToNext();
-
-                if (!cursor.IsAfterLast())
-                {
-                    revId = cursor.GetString(0);
-                    var deleted = cursor.GetInt(1) > 0;
-                    if (deleted)
-                    {
-                        outIsDeleted.AddItem(true);
-                    }
-
-                    // The document is in conflict if there are two+ result rows that are not deletions.
-                    var hasNextResult = cursor.MoveToNext();
-                    if (hasNextResult)
-                    {
-                        var isNextDeleted = cursor.GetInt(1) > 0;
-                        var isInConflict = !deleted && hasNextResult && !isNextDeleted;
-                        if (isInConflict)
-                        {
-                            outIsConflict.AddItem(true);
-                        }
-                    }
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error", e);
-                throw new CouchbaseLiteException("Error", e, new Status(StatusCode.InternalServerError));
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return revId;
-        }
-
-        internal IDictionary<String, Object> DocumentPropertiesFromJSON(IEnumerable<Byte> json, String docId, String revId, Boolean deleted, Int64 sequence, DocumentContentOptions contentOptions)
-        {
-            var rev = new RevisionInternal(docId, revId, deleted);
-            rev.SetSequence(sequence);
-
-            IDictionary<String, Object> extra = ExtraPropertiesForRevision(rev, contentOptions);
-            if (json == null)
-            {
-                return extra;
-            }
-
-            IDictionary<String, Object> docProperties = null;
-            try
-            {
-                docProperties = Manager.GetObjectMapper().ReadValue<IDictionary<string, object>>(json);
-                docProperties.PutAll(extra);
-            }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error serializing properties to JSON", e);
-            }
-            return docProperties;
-        }
-
-
-        /// <summary>Hack because cursor interface does not support cursor.getColumnIndex("deleted") yet.
-        ///     </summary>
-        internal Int32 GetDeletedColumnIndex(QueryOptions options)
-        {
-            Debug.Assert(options != null);
-
-            return options.IsIncludeDocs() ? 5 : 4;
-        }
-
-        internal static String JoinQuotedObjects(IEnumerable<Object> objects)
-        {
-            var strings = new List<String>();
-            foreach (var obj in objects)
-            {
-                strings.AddItem(obj != null ? obj.ToString() : null);
-            }
-            return JoinQuoted(strings);
-        }
-
-        internal static String JoinQuoted(IList<String> strings)
-        {
-            if (strings.Count == 0)
-            {
-                return String.Empty;
-            }
-
-            var result = "'";
-            var first = true;
-
-            foreach (string str in strings)
-            {
-                if (first)
-                    first = false;
-                else
-                    result = result + "','";
-
-                result = result + Quote(str);
-            }
-
-            result = result + "'";
-
-            return result;
-        }
-
-        internal static string Quote(string str)
-        {
-            return str.Replace("'", "''");
-        }
-
-        internal View RegisterView(View view)
-        {
-            if (view == null)
-            {
-                return null;
-            }
-            if (_views == null)
-            {
-                _views = new Dictionary<string, View>();
-            }
-            _views.Put(view.Name, view);
-            return view;
-        }
-
-        internal View MakeAnonymousView()
-        {
-            for (var i = 0; true; ++i)
-            {
-                var name = String.Format("anon{0}", i);
-                var existing = GetExistingView(name);
-                if (existing == null)
-                {
-                    // this name has not been used yet, so let's use it
-                    return GetView(name);
-                }
-            }
-        }
-
-        internal IList<View> GetAllViews()
-        {
-            Cursor cursor = null;
-            IList<View> result = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT name FROM views");
-                result = new List<View>();
-                if (cursor.MoveToNext())
-                {
-                    var name = cursor.GetString(0);
-                    var view = GetView(name);
-                    result.Add(view);
-                }
-            }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error getting all views", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
-
-        internal Status DeleteViewNamed(String name)
-        {
-            var result = new Status(StatusCode.InternalServerError);
-            try
-            {
-                var whereArgs = new [] { name };
-                var rowsAffected = StorageEngine.Delete("views", "name=?", whereArgs);
-
-                if (rowsAffected > 0)
-                {
-                    result.SetCode(StatusCode.Ok);
-                }
-                else
-                {
-                    result.SetCode(StatusCode.NotFound);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error deleting view", e);
-            }
-            return result;
+            return Store.GetAllDocs(options);
         }
 
         /// <summary>
@@ -1982,137 +896,7 @@ PRAGMA user_version = 3;";
         {
             return new Query(this, map);
         }
-
-        internal RevisionInternal GetParentRevision(RevisionInternal rev)
-        {
-            // First get the parent's sequence:
-            var seq = rev.GetSequence();
-            if (seq > 0)
-            {
-                seq = LongForQuery("SELECT parent FROM revs WHERE sequence=?", new [] { Convert.ToString(seq) });
-            }
-            else
-            {
-                var docNumericID = GetDocNumericID(rev.GetDocId());
-                if (docNumericID <= 0)
-                {
-                    return null;
-                }
-                var args = new [] { Convert.ToString(docNumericID), rev.GetRevId() };
-                seq = LongForQuery("SELECT parent FROM revs WHERE doc_id=? and revid=?", args);
-            }
-            if (seq == 0)
-            {
-                return null;
-            }
-
-            // Now get its revID and deletion status:
-            RevisionInternal result = null;
-            var queryArgs = new [] { Convert.ToString(seq) };
-            var queryString = "SELECT revid, deleted FROM revs WHERE sequence=?";
-
-            Cursor cursor = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery(queryString, queryArgs);
-                if (cursor.MoveToNext())
-                {
-                    string revId = cursor.GetString(0);
-                    bool deleted = (cursor.GetInt(1) > 0);
-                    result = new RevisionInternal(rev.GetDocId(), revId, deleted);
-                    result.SetSequence(seq);
-                }
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
-
-        /// <summary>The latest sequence number used.</summary>
-        /// <remarks>
-        /// The latest sequence number used.  Every new revision is assigned a new sequence number,
-        /// so this property increases monotonically as changes are made to the database. It can be
-        /// used to check whether the database has changed between two points in time.
-        /// </remarks>
-        internal Int64 GetLastSequenceNumber()
-        {
-            string sql = "SELECT MAX(sequence) FROM revs";
-            Cursor cursor = null;
-            long result = 0;
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql);
-                if (cursor.MoveToNext())
-                {
-                    result = cursor.GetLong(0);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting last sequence", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
-               
-        /// <exception cref="Couchbase.Lite.Storage.SQLException"></exception>
-        internal Int64 LongForQuery(string sqlQuery, IEnumerable<string> args)
-        {
-            Cursor cursor = null;
-            var result = 0L;
-            try
-            {
-                cursor = StorageEngine.RawQuery(sqlQuery, args.ToArray());
-                if (cursor.MoveToNext())
-                {
-                    result = cursor.GetLong(0);
-                }
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
-
-        /// <summary>Purges specific revisions, which deletes them completely from the local database _without_ adding a "tombstone" revision.
-        ///     </summary>
-        /// <remarks>
-        /// Purges specific revisions, which deletes them completely from the local database _without_ adding a "tombstone" revision. It's as though they were never there.
-        /// This operation is described here: http://wiki.apache.org/couchdb/Purge_Documents
-        /// </remarks>
-        /// <param name="docsToRevs">A dictionary mapping document IDs to arrays of revision IDs.
-        ///     </param>
-        /// <resultOn>success will point to an NSDictionary with the same form as docsToRev, containing the doc/revision IDs that were actually removed.
-        ///     </resultOn>
-        internal IDictionary<String, Object> PurgeRevisions(IDictionary<String, IList<String>> docsToRevs)
-        {
-            var result = new Dictionary<String, Object>();
-            RunInTransaction(() => PurgeRevisionsTask(this, docsToRevs, result));
-            // no such document, skip it
-            // Delete all revisions if magic "*" revision ID is given:
-            // Iterate over all the revisions of the doc, in reverse sequence order.
-            // Keep track of all the sequences to delete, i.e. the given revs and ancestors,
-            // but not any non-given leaf revs or their ancestors.
-            // Purge it and maybe its parent:
-            // Keep it and its parent:
-            // Now delete the sequences to be purged.
-            return result;
-        }
+          
 
         internal void RemoveDocumentFromCache(Document document)
         {
@@ -2124,80 +908,14 @@ PRAGMA user_version = 3;";
 
         internal BlobStore Attachments { get; set; }
 
-        internal String PrivateUUID ()
+        internal String PrivateUUID()
         {
-            string result = null;
-            Cursor cursor = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT value FROM info WHERE key='privateUUID'");
-                if (cursor.MoveToNext())
-                {
-                    result = cursor.GetString(0);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error querying privateUUID", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
+            return Store.GetInfo("privateUUID");
         }
-
-        public bool SequenceHasAttachments(long sequence)
-        {
-            Cursor cursor = null;
-            var args = new [] { Convert.ToString(sequence) };
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT 1 FROM attachments WHERE sequence=? LIMIT 1", args);
-                return cursor.MoveToNext ();
-            }
-            catch (SQLException e)
-            {
-                Log.E(Database.Tag, "Error getting attachments for sequence", e);
-                return false;
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-        }
-
 
         internal String PublicUUID()
         {
-            string result = null;
-            Cursor cursor = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT value FROM info WHERE key='publicUUID'");
-                if (cursor.MoveToNext())
-                {
-                    result = cursor.GetString(0);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error querying privateUUID", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
+            return Store.GetInfo("publicUUID");
         }
 
         internal BlobStoreWriter GetAttachmentWriter()
@@ -2207,77 +925,10 @@ PRAGMA user_version = 3;";
 
         internal Boolean ReplaceUUIDs()
         {
-            var query = "UPDATE INFO SET value='" + Misc.CreateGUID() + "' where key = 'privateUUID';";
-
-            try
-            {
-                StorageEngine.ExecSQL(query);
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error updating UUIDs", e);
-                return false;
-            }
-
-            query = "UPDATE INFO SET value='" + Misc.CreateGUID() + "' where key = 'publicUUID';";
-
-            try
-            {
-                StorageEngine.ExecSQL(query);
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error updating UUIDs", e);
-                return false;
-            }
+            Store.SetInfo("publicUUID", Misc.CreateGUID());
+            Store.SetInfo("privateUUID", Misc.CreateGUID());
 
             return true;
-        }
-
-        internal Attachment GetAttachmentForSequence (long sequence, string filename)
-        {
-            Debug.Assert((sequence > 0));
-            Debug.Assert((filename != null));
-
-            Cursor cursor = null;
-            var args = new [] { Convert.ToString(sequence), filename };
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT key, type FROM attachments WHERE sequence=? AND filename=?", args);
-
-                if (!cursor.MoveToNext())
-                {
-                    throw new CouchbaseLiteException(StatusCode.NotFound);
-                }
-
-                var keyData = cursor.GetBlob(0);
-
-                //TODO add checks on key here? (ios version)
-                var key = new BlobKey(keyData);
-                var contentStream = Attachments.BlobStreamForKey(key);
-                if (contentStream == null)
-                {
-                    Log.E(Tag, "Failed to load attachment");
-                    throw new CouchbaseLiteException(StatusCode.InternalServerError);
-                }
-                else
-                {
-                    var result = new Attachment(contentStream, cursor.GetString(1));
-                    result.Compressed = Attachments.IsGZipped(key);
-                    return result;
-                }
-            }
-            catch (SQLException)
-            {
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
         }
 
         internal void RememberAttachmentWritersForDigests(IDictionary<String, BlobStoreWriter> blobsByDigest)
@@ -2291,580 +942,60 @@ PRAGMA user_version = 3;";
             PendingAttachmentsByDigest[digest] = writer;
         }
 
-        internal Int64 GetDocNumericID(string docId)
+
+        internal RevisionInternal GetDocumentWithIDAndRev(String id, String revId, DocumentContentOptions contentOptions)
         {
-            Cursor cursor = null;
-            string[] args = new string[] { docId };
-            long result = -1;
-            try
-            {
-                cursor = StorageEngine.IntransactionRawQuery("SELECT doc_id FROM docs WHERE docid=?", args);
-                if (cursor.MoveToNext())
-                {
-                    result = cursor.GetLong(0);
-                }
-                else
-                {
-                    result = 0;
+            var rev = Store.GetDocument(id, revId, contentOptions);
+            if(rev != null && contentOptions.HasFlag(DocumentContentOptions.IncludeAttachments)) {
+                if(!ExpandAttachments(rev, contentOptions)) {
+                    return null;
                 }
             }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error getting doc numeric id", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
+
+            return rev;
         }
 
-        /// <summary>Begins a database transaction.</summary>
-        /// <remarks>
-        /// Begins a database transaction. Transactions can nest.
-        /// Every beginTransaction() must be balanced by a later endTransaction()
-        /// </remarks>
-        internal Boolean BeginTransaction()
+        internal bool ExpandAttachments(RevisionInternal rev, DocumentContentOptions options)
         {
-            try
+            bool success = true;
+            rev.MutateAttachments((name, attachment) =>
             {
-                StorageEngine.BeginTransaction();
+                if(attachment.ContainsKey("stub") || attachment.ContainsKey("follows")) {
+                    attachment.Remove("stub");
+                    attachment.Remove("follows");
 
-                ++_transactionLevel;
+                    Attachment attachObj = GetAttachmentForDict(attachment, name);
+                    if(attachObj == null) {
+                        Log.W(Tag, "Can't get attachment '{0}' of {1}", name, rev);
+                        success = false;
+                        return attachment;
+                    }
 
-                Log.D(Tag, "Begin transaction (level " + _transactionLevel + ")");
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag," Error calling beginTransaction()" , e);
+                    var data = attachObj.Content;
+                    if(data != null) {
+                        attachment["data"] = Convert.ToBase64String(data.ToArray());
+                        success &= true;
+                    } else {
+                        Log.W(Tag, "Can't get binary data of attachment '{0}' of {1}", name, rev);
+                        success = false;
+                    }
+                }
 
-                return false;
-            }
-            return true;
+                return attachment;
+            });
+
+            return success;
         }
 
-        /// <summary>Commits or aborts (rolls back) a transaction.</summary>
-        /// <param name="commit">If true, commits; if false, aborts and rolls back, undoing all changes made since the matching -beginTransaction call, *including* any committed nested transactions.
-        ///     </param>
-        internal Boolean EndTransaction(bool commit)
+        internal Attachment GetAttachmentForDict(IDictionary<string, object> info, string filename)
         {
-            Debug.Assert((_transactionLevel > 0));
-
-            if (commit)
-            {
-                Log.D(Tag, "Committing transaction (level " + _transactionLevel + ")");
-
-                StorageEngine.SetTransactionSuccessful();
-                StorageEngine.EndTransaction();
-            }
-            else
-            {
-                Log.V(Tag, "CANCEL transaction (level " + _transactionLevel + ")");
-                try
-                {
-                    StorageEngine.EndTransaction();
-                }
-                catch (SQLException e)
-                {
-                    Log.E(Tag, " Error calling endTransaction()", e);
-
-                    return false;
-                }
-            }
-
-            --_transactionLevel;
-            PostChangeNotifications();
-
-            return true;
-        }
-
-        internal static Boolean PurgeRevisionsTask(Database enclosingDatabase, IDictionary<String, IList<String>> docsToRevs, IDictionary<String, Object> result)
-        {
-            foreach (string docID in docsToRevs.Keys)
-            {
-                long docNumericID = enclosingDatabase.GetDocNumericID(docID);
-                if (docNumericID == -1)
-                {
-                    continue;
-                }
-                var revsPurged = new List<string>();
-                var revIDs = docsToRevs [docID];
-                if (revIDs == null)
-                {
-                    return false;
-                }
-                else
-                {
-                    if (revIDs.Count == 0)
-                    {
-                        revsPurged = new List<string>();
-                    }
-                    else
-                    {
-                        if (revIDs.Contains("*"))
-                        {
-                            try
-                            {
-                                var args = new[] { Convert.ToString(docNumericID) };
-                                enclosingDatabase.StorageEngine.ExecSQL("DELETE FROM revs WHERE doc_id=?", args);
-                            }
-                            catch (SQLException e)
-                            {
-                                Log.E(Tag, "Error deleting revisions", e);
-                                return false;
-                            }
-                            revsPurged = new List<string>();
-                            revsPurged.AddItem("*");
-                        }
-                        else
-                        {
-                            Cursor cursor = null;
-                            try
-                            {
-                                var args = new [] { Convert.ToString(docNumericID) };
-                                var queryString = "SELECT revid, sequence, parent FROM revs WHERE doc_id=? ORDER BY sequence DESC";
-                                cursor = enclosingDatabase.StorageEngine.RawQuery(queryString, args);
-                                if (!cursor.MoveToNext())
-                                {
-                                    Log.W(Tag, "No results for query: " + queryString);
-                                    return false;
-                                }
-                                var seqsToPurge = new HashSet<long>();
-                                var seqsToKeep = new HashSet<long>();
-                                var revsToPurge = new HashSet<string>();
-                                while (!cursor.IsAfterLast())
-                                {
-                                    string revID = cursor.GetString(0);
-                                    long sequence = cursor.GetLong(1);
-                                    long parent = cursor.GetLong(2);
-                                    if (seqsToPurge.Contains(sequence) || revIDs.Contains(revID) && !seqsToKeep.Contains
-                                            (sequence))
-                                    {
-                                        seqsToPurge.AddItem(sequence);
-                                        revsToPurge.AddItem(revID);
-                                        if (parent > 0)
-                                        {
-                                            seqsToPurge.AddItem(parent);
-                                        }
-                                    }
-                                    else
-                                    {
-                                        seqsToPurge.Remove(sequence);
-                                        revsToPurge.Remove(revID);
-                                        seqsToKeep.AddItem(parent);
-                                    }
-                                    cursor.MoveToNext();
-                                }
-                                seqsToPurge.RemoveAll(seqsToKeep);
-                                Log.I(Tag, String.Format("Purging doc '{0}' revs ({1}); asked for ({2})", docID, revsToPurge, revIDs));
-                                if (seqsToPurge.Count > 0)
-                                {
-                                    string seqsToPurgeList = String.Join(",", seqsToPurge);
-                                    string sql = string.Format("DELETE FROM revs WHERE sequence in ({0})", seqsToPurgeList);
-                                    try
-                                    {
-                                        enclosingDatabase.StorageEngine.ExecSQL(sql);
-                                    }
-                                    catch (SQLException e)
-                                    {
-                                        Log.E(Tag, "Error deleting revisions via: " + sql, e);
-                                        return false;
-                                    }
-                                }
-                                Collections.AddAll(revsPurged, revsToPurge);
-                            }
-                            catch (SQLException e)
-                            {
-                                Log.E(Tag, "Error getting revisions", e);
-                                return false;
-                            }
-                            finally
-                            {
-                                if (cursor != null)
-                                {
-                                    cursor.Close();
-                                }
-                            }
-                        }
-                    }
-                }
-                result[docID] = revsPurged;
-            }
-            return true;
-        }
-
-        internal RevisionInternal GetDocumentWithIDAndRev(String id, String rev, DocumentContentOptions contentOptions)
-        {
-            RevisionInternal result = null;
-            string sql;
-            Cursor cursor = null;
-            try
-            {
-                cursor = null;
-                var cols = "revid, deleted, sequence, no_attachments";
-                if (!contentOptions.HasFlag(DocumentContentOptions.NoBody))
-                {
-                    cols += ", json";
-                }
-                if (rev != null)
-                {
-                    sql = "SELECT " + cols + " FROM revs, docs WHERE docs.docid=? AND revs.doc_id=docs.doc_id AND revid=? LIMIT 1";
-                    //TODO: mismatch w iOS: {sql = "SELECT " + cols + " FROM revs WHERE revs.doc_id=? AND revid=? AND json notnull LIMIT 1";}
-                    var args = new[] { id, rev };
-                    cursor = StorageEngine.IntransactionRawQuery(sql, args);
-                }
-                else
-                {
-                    sql = "SELECT " + cols + " FROM revs, docs WHERE docs.docid=? AND revs.doc_id=docs.doc_id and current=1 and deleted=0 ORDER BY revid DESC LIMIT 1";
-                    //TODO: mismatch w iOS: {sql = "SELECT " + cols + " FROM revs WHERE revs.doc_id=? and current=1 and deleted=0 ORDER BY revid DESC LIMIT 1";}
-                    var args = new[] { id };
-                    cursor = StorageEngine.IntransactionRawQuery(sql, args);
-                }
-                if (cursor.MoveToNext())
-                {
-                    if (rev == null)
-                    {
-                        rev = cursor.GetString(0);
-                    }
-                    var deleted = cursor.GetInt(1) > 0;
-                    result = new RevisionInternal(id, rev, deleted);
-                    result.SetSequence(cursor.GetLong(2));
-                    if (contentOptions != DocumentContentOptions.NoBody)
-                    {
-                        byte[] json = null;
-                        if (!contentOptions.HasFlag(DocumentContentOptions.NoBody))
-                        {
-                            json = cursor.GetBlob(4);
-                        }
-                        if (cursor.GetInt(3) > 0)
-                        {
-                            // no_attachments == true
-                            contentOptions |= DocumentContentOptions.NoAttachments;
-                        }
-                        ExpandStoredJSONIntoRevisionWithAttachments(json, result, contentOptions);
-                    }
-                }
-            }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error getting document with id and rev", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
-
-        /// <summary>Inserts the _id, _rev and _attachments properties into the JSON data and stores it in rev.
-        ///     </summary>
-        /// <remarks>
-        /// Inserts the _id, _rev and _attachments properties into the JSON data and stores it in rev.
-        /// Rev must already have its revID and sequence properties set.
-        /// </remarks>
-        internal void ExpandStoredJSONIntoRevisionWithAttachments(IEnumerable<Byte> json, RevisionInternal rev, DocumentContentOptions contentOptions)
-        {
-            var extra = ExtraPropertiesForRevision(rev, contentOptions);
-
-            if (json != null && json.Any())
-            {
-                rev.SetJson(AppendDictToJSON(json, extra));
-            }
-            else
-            {
-                rev.SetProperties(extra);
-                if (json == null)
-                {
-                    rev.SetMissing(true);
-                }
-            }
-        }
-
-        /// <summary>Inserts the _id, _rev and _attachments properties into the JSON data and stores it in rev.
-        ///     </summary>
-        /// <remarks>
-        /// Inserts the _id, _rev and _attachments properties into the JSON data and stores it in rev.
-        /// Rev must already have its revID and sequence properties set.
-        /// </remarks>
-        internal IDictionary<String, Object> ExtraPropertiesForRevision(RevisionInternal rev, DocumentContentOptions contentOptions)
-        {
-            var docId = rev.GetDocId();
-            var revId = rev.GetRevId();
-
-            var sequenceNumber = rev.GetSequence();
-
-            Debug.Assert((revId != null));
-            Debug.Assert((sequenceNumber > 0));
-
-            // Get attachment metadata, and optionally the contents:
-            IDictionary<string, object> attachmentsDict = null;
-
-            if (!contentOptions.HasFlag(DocumentContentOptions.NoAttachments))
-            {
-                attachmentsDict = GetAttachmentsDictForSequenceWithContent (sequenceNumber, contentOptions);
-            }
-            // Get more optional stuff to put in the properties:
-            //OPT: This probably ends up making redundant SQL queries if multiple options are enabled.
-            var localSeq = -1L;
-            if (contentOptions.HasFlag(DocumentContentOptions.IncludeLocalSeq))
-            {
-                localSeq = sequenceNumber;
-            }
-            IDictionary<string, object> revHistory = null;
-            if (contentOptions.HasFlag(DocumentContentOptions.IncludeRevs))
-            {
-                revHistory = GetRevisionHistoryDict(rev);
-            }
-            IList<object> revsInfo = null;
-            if (contentOptions.HasFlag(DocumentContentOptions.IncludeRevsInfo))
-            {
-                revsInfo = new List<object>();
-                var revHistoryFull = GetRevisionHistory(rev);
-                foreach (RevisionInternal historicalRev in revHistoryFull)
-                {
-                    var revHistoryItem = new Dictionary<string, object>();
-                    var status = "available";
-                    if (historicalRev.IsDeleted())
-                    {
-                        status = "deleted";
-                    }
-
-                    if (historicalRev.IsMissing())
-                    {
-                        status = "missing";
-                    }
-                    revHistoryItem.Put("rev", historicalRev.GetRevId());
-                    revHistoryItem["status"] = status;
-                    revsInfo.AddItem(revHistoryItem);
-                }
-            }
-            IList<string> conflicts = null;
-            if (contentOptions.HasFlag(DocumentContentOptions.IncludeConflicts))
-            {
-                var revs = GetAllRevisionsOfDocumentID(docId, true);
-                if (revs.Count > 1)
-                {
-                    conflicts = new List<string>();
-                    foreach (RevisionInternal savedRev in revs)
-                    {
-                        if (!(savedRev.Equals(rev) || savedRev.IsDeleted()))
-                        {
-                            conflicts.AddItem(savedRev.GetRevId());
-                        }
-                    }
-                }
-            }
-
-            var result = new Dictionary<string, object>();
-            result["_id"] = docId;
-            result["_rev"] = revId;
-
-            if (rev.IsDeleted())
-            {
-                result["_deleted"] = true;
-            }
-            if (attachmentsDict != null)
-            {
-                result["_attachments"] = attachmentsDict;
-            }
-            if (localSeq > -1)
-            {
-                result["_local_seq"] = localSeq;
-            }
-            if (revHistory != null)
-            {
-                result["_revisions"] = revHistory;
-            }
-            if (revsInfo != null)
-            {
-                result["_revs_info"] = revsInfo;
-            }
-            if (conflicts != null)
-            {
-                result["_conflicts"] = conflicts;
-            }
-            return result;
-        }
-
-        /// <summary>Returns an array of TDRevs in reverse chronological order, starting with the given revision.
-        ///     </summary>
-        /// <remarks>Returns an array of TDRevs in reverse chronological order, starting with the given revision.
-        ///     </remarks>
-        internal IList<RevisionInternal> GetRevisionHistory(RevisionInternal rev)
-        {
-            string docId = rev.GetDocId();
-            string revId = rev.GetRevId();
-
-            Debug.Assert(((docId != null) && (revId != null)));
-
-            long docNumericId = GetDocNumericID(docId);
-            if (docNumericId < 0)
-            {
+            if(info == null) {
                 return null;
             }
-            else
-            {
-                if (docNumericId == 0)
-                {
-                    return new List<RevisionInternal>();
-                }
-            }
 
-            Cursor cursor = null;
-            IList<RevisionInternal> result;
-            var args = new [] { Convert.ToString(docNumericId) };
-            var sql = "SELECT sequence, parent, revid, deleted, json isnull  FROM revs WHERE doc_id=? ORDER BY sequence DESC";
-
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql, args);
-                cursor.MoveToNext();
-
-                long lastSequence = 0;
-                result = new List<RevisionInternal>();
-
-                while (!cursor.IsAfterLast())
-                {
-                    var sequence = cursor.GetLong(0);
-                    var parent = cursor.GetLong(1);
-
-                    bool matches = false;
-                    if (lastSequence == 0)
-                    {
-                        matches = revId.Equals(cursor.GetString(2));
-                    }
-                    else
-                    {
-                        matches = (sequence == lastSequence);
-                    }
-                    if (matches)
-                    {
-                        revId = cursor.GetString(2);
-                        var deleted = (cursor.GetInt(3) > 0);
-                        var missing = (cursor.GetInt(4) > 0);
-
-                        var aRev = new RevisionInternal(docId, revId, deleted);
-                        aRev.SetSequence(sequence);
-                        aRev.SetMissing(missing);
-                        result.AddItem(aRev);
-
-                        if (parent > -1)
-                            lastSequence = parent;
-
-                        if (lastSequence == 0)
-                        {
-                            break;
-                        }
-                    }
-                    cursor.MoveToNext();
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting revision history", e);
-                return null;
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
-        }
-
-        /// <summary>Returns the revision history as a _revisions dictionary, as returned by the REST API's ?revs=true option.
-        ///     </summary>
-        internal IDictionary<String, Object> GetRevisionHistoryDict(RevisionInternal rev)
-        {
-            return MakeRevisionHistoryDict(GetRevisionHistory(rev));
-        }
-
-        internal IDictionary<string, object> GetRevisionHistoryDictStartingFromAnyAncestor(RevisionInternal rev, IList<string>ancestorRevIDs)
-        {
-            var history = GetRevisionHistory(rev); // This is in reverse order, newest ... oldest
-            if (ancestorRevIDs != null && ancestorRevIDs.Any())
-            {
-                for (var i = 0; i < history.Count; i++)
-                {
-                    if (ancestorRevIDs.Contains(history[i].GetRevId()))
-                    {
-                        var newHistory = new List<RevisionInternal>();
-                        for (var index = 0; index < i + 1; index++) 
-                        {
-                            newHistory.Add(history[index]);
-                        }
-                        history = newHistory;
-                        break;
-                    }
-                }
-            }
-
-            return MakeRevisionHistoryDict(history);
-        }
-
-        internal static IDictionary<string, object> MakeRevisionHistoryDict(IList<RevisionInternal> history)
-        {
-            if (history == null)
-                return null;
-
-            // Try to extract descending numeric prefixes:
-            var suffixes = new List<string>();
-            var start = -1;
-            var lastRevNo = -1;
-
-            foreach (var rev in history)
-            {
-                var revNo = ParseRevIDNumber(rev.GetRevId());
-                var suffix = ParseRevIDSuffix(rev.GetRevId());
-                if (revNo > 0 && suffix.Length > 0)
-                {
-                    if (start < 0)
-                    {
-                        start = revNo;
-                    }
-                    else
-                    {
-                        if (revNo != lastRevNo - 1)
-                        {
-                            start = -1;
-                            break;
-                        }
-                    }
-                    lastRevNo = revNo;
-                    suffixes.AddItem(suffix);
-                }
-                else
-                {
-                    start = -1;
-                    break;
-                }
-            }
-
-            var result = new Dictionary<String, Object>();
-            if (start == -1)
-            {
-                // we failed to build sequence, just stuff all the revs in list
-                suffixes = new List<string>();
-                foreach (RevisionInternal rev_1 in history)
-                {
-                    suffixes.AddItem(rev_1.GetRevId());
-                }
-            }
-            else
-            {
-                result["start"] = start;
-            }
-
-            result["ids"] = suffixes;
-            return result;
+            var retVal = new Attachment(null, filename, info);
+            retVal.Database = this;
+            return retVal;
         }
 
         /// <summary>Parses the _revisions dict from a document into an array of revision ID strings.</summary>
@@ -2935,97 +1066,7 @@ PRAGMA user_version = 3;";
             }
             return result;
         }
-
-        /// <summary>Constructs an "_attachments" dictionary for a revision, to be inserted in its JSON body.</summary>
-        internal IDictionary<String, Object> GetAttachmentsDictForSequenceWithContent(long sequence, DocumentContentOptions contentOptions)
-        {
-            Debug.Assert((sequence > 0));
-
-            Cursor cursor = null;
-            var args = new Object[] { sequence };
-
-            try
-            {
-                cursor = StorageEngine.RawQuery("SELECT filename, key, type, length, revpos FROM attachments WHERE sequence=?", args);
-                if (!cursor.MoveToNext())
-                {
-                    return null;
-                }
-
-                var result = new Dictionary<String, Object>();
-
-                while (!cursor.IsAfterLast())
-                {
-                    var dataSuppressed = false;
-                    var filename = cursor.GetString(0);
-                    var keyData = cursor.GetBlob(1);
-                    var contentType = cursor.GetString(2);
-                    var length = cursor.GetInt(3);
-                    var revpos = cursor.GetInt(4);
-
-                    var key = new BlobKey(keyData);
-                    var digestString = "sha1-" + Convert.ToBase64String(keyData);
-
-                    var dataBase64 = (string) null;
-                    if (contentOptions.HasFlag(DocumentContentOptions.IncludeAttachments))
-                    {
-                        if (contentOptions.HasFlag(DocumentContentOptions.BigAttachmentsFollow) && 
-                            length >= Database.BigAttachmentLength)
-                        {
-                            dataSuppressed = true;
-                        }
-                        else
-                        {
-                            byte[] data = Attachments.BlobForKey(key);
-                            if (data != null)
-                            {
-                                // <-- very expensive
-                                dataBase64 = Convert.ToBase64String(data);
-                            }
-                            else
-                            {
-                                Log.W(Tag, "Error loading attachment");
-                            }
-                        }
-                    }
-                    var attachment = new Dictionary<string, object>();
-                    if (!(dataBase64 != null || dataSuppressed))
-                    {
-                        attachment["stub"] = true;
-                    }
-                    if (dataBase64 != null)
-                    {
-                        attachment["data"] = dataBase64;
-                    }
-                    if (dataSuppressed) {
-                        attachment.Put ("follows", true);
-                    }
-                    attachment["digest"] = digestString;
-
-                    attachment["content_type"] = contentType;
-                    attachment["length"] = length;
-                    attachment["revpos"] = revpos;
-
-                    result[filename] = attachment;
-
-                    cursor.MoveToNext();
-                }
-                return result;
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error getting attachments for sequence", e);
-                return null;
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-        }
-
+            
         /// <summary>Splices the contents of an NSDictionary into JSON data (that already represents a dict), without parsing the JSON.</summary>
         internal IEnumerable<Byte> AppendDictToJSON(IEnumerable<Byte> json, IDictionary<String, Object> dict)
         {
@@ -3100,326 +1141,37 @@ PRAGMA user_version = 3;";
             var docId = oldRev.GetDocId();
             var deleted = oldRev.IsDeleted();
 
-            if ((oldRev == null) || ((prevRevId != null) && (docId == null)) || (deleted && (docId == null)) || ((docId != null) && !IsValidDocumentId(docId)))
-            {
-                throw new CouchbaseLiteException(StatusCode.BadRequest);
+            if((oldRev == null) || ((prevRevId != null) && (docId == null)) || (deleted && (docId == null)) || ((docId != null) && !IsValidDocumentId(docId))) {
+                throw new CouchbaseLiteException(StatusCode.BadId);
             }
 
-            Cursor cursor = null;
-            var inConflict = false;
-            RevisionInternal winningRev = null;
-            RevisionInternal newRev = null;
-
-            var transactionSucceeded = RunInTransaction(() =>
-            {
-                // PART I: In which are performed lookups and validations prior to the insert...
-                var docNumericID = (docId != null) ? GetDocNumericID(docId) : 0;
-                var parentSequence = 0L;
-                string oldWinningRevID = null;
-
-                try
-                {
-                    var oldWinnerWasDeletion = false;
-                    var wasConflicted = false;
-
-                    if (docNumericID > 0)
-                    {
-                        var outIsDeleted = new List<bool>();
-                        var outIsConflict = new List<bool>();
-
-                        try
-                        {
-                            oldWinningRevID = WinningRevIDOfDoc(docNumericID, outIsDeleted, outIsConflict);
-                            oldWinnerWasDeletion |= outIsDeleted.Count > 0;
-                            wasConflicted |= outIsConflict.Count > 0;
-                        }
-                        catch (Exception e)
-                        {
-                            Sharpen.Runtime.PrintStackTrace(e);
-                        }
-                    }
-                    if (prevRevId != null)
-                    {
-                        // Replacing: make sure given prevRevID is current & find its sequence number:
-                        if (docNumericID <= 0)
-                        {
-                            var msg = string.Format("No existing revision found with doc id: {0}", docId);
-                            throw new CouchbaseLiteException(msg, StatusCode.NotFound);
-                        }
-
-                        parentSequence = GetSequenceOfDocument(docNumericID, prevRevId, !allowConflict);
-
-                        if (parentSequence == 0)
-                        {
-                            // Not found: either a 404 or a 409, depending on whether there is any current revision
-                            if (!allowConflict && ExistsDocumentWithIDAndRev(docId, null))
-                            {
-                                var msg = string.Format("Conflicts not allowed and there is already an existing doc with id: {0}", docId);
-                                throw new CouchbaseLiteException(msg, StatusCode.Conflict);
-                            }
-                            else
-                            {
-                                var msg = string.Format("No existing revision found with doc id: {0}", docId);
-                                throw new CouchbaseLiteException(msg, StatusCode.NotFound);
-                            }
-                        }
-
-                        if (_validations != null && _validations.Count > 0)
-                        {
-                            // Fetch the previous revision and validate the new one against it:
-                            var oldRevCopy = oldRev.CopyWithDocID(oldRev.GetDocId(), null);
-                            var prevRev = new RevisionInternal(docId, prevRevId, false);
-
-                            ValidateRevision(oldRevCopy, prevRev, prevRevId);
-                        }
-                    }
-                    else
-                    {
-                        // Inserting first revision.
-                        if (deleted && (docId != null))
-                        {
-                            // Didn't specify a revision to delete: 404 or a 409, depending
-                            if (ExistsDocumentWithIDAndRev(docId, null))
-                            {
-                                throw new CouchbaseLiteException(StatusCode.Conflict);
-                            }
-                            else
-                            {
-                                throw new CouchbaseLiteException(StatusCode.NotFound);
-                            }
-                        }
-
-                        // Validate:
-                        ValidateRevision(oldRev, null, null);
-
-                        if (docId != null)
-                        {
-                            // Inserting first revision, with docID given (PUT):
-                            if (docNumericID <= 0)
-                            {
-                                // Doc doesn't exist at all; create it:
-                                docNumericID = InsertDocumentID(docId);
-
-                                if (docNumericID <= 0)
-                                {
-                                    return false;
-                                }
-                            }
-                            else
-                            {
-                                // Doc ID exists; check whether current winning revision is deleted:
-                                if (oldWinnerWasDeletion)
-                                {
-                                    prevRevId = oldWinningRevID;
-                                    parentSequence = GetSequenceOfDocument(docNumericID, prevRevId, false);
-                                }
-                                else
-                                {
-                                    if (oldWinningRevID != null)
-                                    {
-                                        // The current winning revision is not deleted, so this is a conflict
-                                        throw new CouchbaseLiteException(StatusCode.Conflict);
-                                    }
-                                }
-                            }
-                        }
-                        else
-                        {
-                            // Inserting first revision, with no docID given (POST): generate a unique docID:
-                            docId = Database.GenerateDocumentId();
-                            docNumericID = InsertDocumentID(docId);
-
-                            if (docNumericID <= 0)
-                            {
-                                return false;
-                            }
-                        }
-                    }
-
-                    // There may be a conflict if (a) the document was already in conflict, or
-                    // (b) a conflict is created by adding a non-deletion child of a non-winning rev.
-                    inConflict = wasConflicted
-                    || (!deleted && prevRevId != null && oldWinningRevID != null && !prevRevId.Equals(oldWinningRevID));
-
-                    // PART II: In which we prepare for insertion...
-                    // Get the attachments:
-                    var attachments = GetAttachmentsFromRevision(oldRev);
-
-                    // Bump the revID and update the JSON:
-                    IList<byte> json = null;
-
-
-                    if (!oldRev.IsDeleted()) //oldRev.GetProperties() != null && oldRev.GetProperties().Any())
-                    {
-                        json = EncodeDocumentJSON(oldRev).ToList();
-
-                        if (json == null)
-                        {
-                            // bad or missing json
-                            throw new CouchbaseLiteException(StatusCode.BadRequest);
-                        }
-
-                        if (json.Count() == 2 && json[0] == '{' && json[1] == '}')
-                        {
-                            json = null;
-                        }
-                    }
-                    else
-                    {
-                        json = Encoding.UTF8.GetBytes("{}"); // NOTE.ZJG: Confirm w/ Traun. This prevents a null reference exception in call to InsertRevision below.
-                    }
-
-                    var newRevId = GenerateIDForRevision(oldRev, json, attachments, prevRevId);
-                    newRev = oldRev.CopyWithDocID(docId, newRevId);
-                    StubOutAttachmentsInRevision(attachments, newRev);
-
-                    // Now insert the rev itself:
-                    var newSequence = InsertRevision(newRev, docNumericID, parentSequence, true, (attachments.Count > 0), json);
-
-                    if (newSequence <= 0)
-                    {
-                        return false;
-                    }
-
-                    // Make replaced rev non-current:
-                    try
-                    {
-                        var args = new ContentValues();
-                        args["current"] = 0;
-                        StorageEngine.Update("revs", args, "sequence=?", new[] { parentSequence.ToString() });
-                    }
-                    catch (SQLException e)
-                    {
-                        Log.E(Database.Tag, "Error setting parent rev non-current", e);
-                        throw new CouchbaseLiteException(StatusCode.InternalServerError);
-                    }
-
-                    // Store any attachments:
-                    if (attachments != null)
-                    {
-                        ProcessAttachmentsForRevision(attachments, newRev, parentSequence);
-                    }
-
-                    // Figure out what the new winning rev ID is:
-                    winningRev = Winner(docNumericID, oldWinningRevID, oldWinnerWasDeletion, newRev);
-
-                    // Success!
-                    if (deleted)
-                    {
-                        resultStatus.SetCode(StatusCode.Ok);
-                    }
-                    else
-                    {
-                        resultStatus.SetCode(StatusCode.Created);
-                    }
-                }
-                catch (SQLException e1)
-                {
-                    Log.E(Tag, "Error putting revision", e1);
-                    return false;
-                }
-                finally
-                {
-                    if (cursor != null)
-                    {
-                        cursor.Close();
-                    }
-
-
-
-                    if (!string.IsNullOrEmpty(docId))
-                    {
-                        UnsavedRevisionDocumentCache.Remove(docId);
-                    }
+            if(oldRev.GetProperties().ContainsKey("_attachments")) {
+                var tmpRev = new RevisionInternal(docId, prevRevId, deleted);
+                tmpRev.SetProperties(oldRev.GetProperties());
+                if(!ProcessAttachmentsForRevision(oldRev, prevRevId)) {
+                    return null;
                 }
 
-                return resultStatus.IsSuccessful;
-            });
-
-            if (!transactionSucceeded)
-                return null;
-
-            // EPILOGUE: A change notification is sent...
-            NotifyChange(newRev, winningRev, null, inConflict);
-            return newRev;
-        }
-
-        internal RevisionInternal Winner(Int64 docNumericID, String oldWinningRevID, Boolean oldWinnerWasDeletion, RevisionInternal newRev)
-        {
-            if (oldWinningRevID == null)
-            {
-                return newRev;
+                oldRev.SetProperties(tmpRev.GetProperties());
             }
-            var newRevID = newRev.GetRevId();
-            if (!newRev.IsDeleted())
-            {
-                if (oldWinnerWasDeletion || RevisionInternal.CBLCompareRevIDs(newRevID, oldWinningRevID) > 0)
-                {
-                    return newRev;
-                }
-            }
-            else
-            {
-                // this is now the winning live revision
-                if (oldWinnerWasDeletion)
-                {
-                    if (RevisionInternal.CBLCompareRevIDs(newRevID, oldWinningRevID) > 0)
-                    {
-                        return newRev;
-                    }
-                }
-                else
-                {
-                    // doc still deleted, but this beats previous deletion rev
-                    // Doc was alive. How does this deletion affect the winning rev ID?
-                    var outIsDeleted = new List<bool>();
-                    var outIsConflict = new List<bool>();
-                    var winningRevID = WinningRevIDOfDoc(docNumericID, outIsDeleted, outIsConflict);
 
-                    if (!winningRevID.Equals(oldWinningRevID))
-                    {
-                        if (winningRevID.Equals(newRev.GetRevId()))
-                        {
-                            return newRev;
-                        }
-                        else
-                        {
-                            var deleted = false;
-                            var winningRev = new RevisionInternal(newRev.GetDocId(), winningRevID, deleted);
-                            return winningRev;
-                        }
-                    }
+            StoreValidateDelegate validationBlock = (next, prev, prevId) =>
+            {
+                try {
+                    ValidateRevision(next, prev, prevId);
+                } catch(CouchbaseLiteException e) {
+                    return e.GetCBLStatus();
                 }
-            }
-            return null;
-        }
 
-        private Int64 GetSequenceOfDocument(Int64 docNumericId, String revId, Boolean onlyCurrent)
-        {
-            var result = -1L;
-            Cursor cursor = null;
-            try
-            {
-                var extraSql = (onlyCurrent ? "AND current=1" : string.Empty);
-                var sql = string.Format("SELECT sequence FROM revs WHERE doc_id=? AND revid=? {0} LIMIT 1", extraSql);
-                var args = new [] { string.Empty + docNumericId, revId };
-                cursor = StorageEngine.IntransactionRawQuery(sql, args);
-                result = cursor.MoveToNext()
-                             ? cursor.GetLong(0)
-                             : 0;
+                return new Status(StatusCode.Ok);
+            };
+
+            var putRev = Store.PutRevision(docId, prevRevId, oldRev.GetProperties(), deleted, allowConflict, validationBlock);
+            if(putRev != null) {
+                Log.D(Tag, "Put revision --> ", putRev);
             }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error getting getSequenceOfDocument", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return result;
+
+            return putRev;
         }
 
         internal void PostChangeNotifications()
@@ -3427,26 +1179,21 @@ PRAGMA user_version = 3;";
             // This is a 'while' instead of an 'if' because when we finish posting notifications, there
             // might be new ones that have arrived as a result of notification handlers making document
             // changes of their own (the replicator manager will do this.) So we need to check again.
-            while (_transactionLevel == 0 && _isOpen && !_isPostingChangeNotifications && _changesToNotify.Count > 0)
-            {
-                try
-                {
+            while(_transactionLevel == 0 && _isOpen && !_isPostingChangeNotifications && _changesToNotify.Count > 0) {
+                try {
                     _isPostingChangeNotifications = true;
 
                     IList<DocumentChange> outgoingChanges = new List<DocumentChange>();
-                    foreach (var change in _changesToNotify)
-                    {
+                    foreach(var change in _changesToNotify) {
                         outgoingChanges.Add(change);
                     }
                     _changesToNotify.Clear();
                     // TODO: change this to match iOS and call cachedDocumentWithID
                     var isExternal = false;
-                    foreach (var change in outgoingChanges)
-                    {
+                    foreach(var change in outgoingChanges) {
                         var document = GetDocument(change.DocumentId);
                         document.RevisionAdded(change);
-                        if (change.SourceUrl != null)
-                        {
+                        if(change.SourceUrl != null) {
                             isExternal = true;
                         }
                     }
@@ -3455,251 +1202,109 @@ PRAGMA user_version = 3;";
                         Changes = outgoingChanges,
                         IsExternal = isExternal,
                         Source = this
-                    } ;
+                    };
 
                     var changeEvent = Changed;
-                    if (changeEvent != null)
+                    if(changeEvent != null)
                         changeEvent(this, args);
-                }
-                catch (Exception e)
-                {
+                } catch(Exception e) {
                     Log.E(Tag, " got exception posting change notifications", e);
-                }
-                finally
-                {
+                } finally {
                     _isPostingChangeNotifications = false;
                 }
             }
         }
 
-        internal void NotifyChange(RevisionInternal rev, RevisionInternal winningRev, Uri source, bool inConflict)
+        internal bool ProcessAttachmentsForRevision(RevisionInternal rev, string prevRevId)
         {
-            var change = new DocumentChange(rev, winningRev, inConflict, source);
-            _changesToNotify.Add(change);
-
-            PostChangeNotifications();
-        }
-
-        /// <summary>
-        /// Given a newly-added revision, adds the necessary attachment rows to the sqliteDb and
-        /// stores inline attachments into the blob store.
-        /// </summary>
-        /// <remarks>
-        /// Given a newly-added revision, adds the necessary attachment rows to the sqliteDb and
-        /// stores inline attachments into the blob store.
-        /// </remarks>
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void ProcessAttachmentsForRevision(IDictionary<string, AttachmentInternal> attachments, RevisionInternal rev, long parentSequence)
-        {
-            Debug.Assert((rev != null));
-            var newSequence = rev.GetSequence();
-            Debug.Assert((newSequence > parentSequence));
-            var generation = rev.GetGeneration();
-            Debug.Assert((generation > 0));
-
+            throw new NotImplementedException();
             // If there are no attachments in the new rev, there's nothing to do:
-            IDictionary<string, object> revAttachments = null;
+            /*IDictionary<string, object> revAttachments = null;
             var properties = rev.GetProperties ();
-            if (properties != null)
-            {
+            if(properties != null) {
                 revAttachments = properties.Get("_attachments").AsDictionary<string, object>();
             }
 
-            if (revAttachments == null || revAttachments.Count == 0 || rev.IsDeleted())
-            {
-                return;
+            if(revAttachments == null) {
+                return true;
             }
 
-            foreach (string name in revAttachments.Keys)
+            if(revAttachments.Count == 0 || rev.IsDeleted()) {
+                properties.Remove("_attachments");
+                rev.SetProperties(properties);
+                return true;
+            }
+
+            var generation = RevisionInternal.GenerationFromRevID(prevRevId) + 1;
+            IDictionary<string, object> parentAttachments = null;
+            return rev.MutateAttachments((name, attachment) =>
             {
-                var attachment = attachments.Get(name);
-                if (attachment != null)
-                {
-                    // Determine the revpos, i.e. generation # this was added in. Usually this is
-                    // implicit, but a rev being pulled in replication will have it set already.
-                    if (attachment.GetRevpos() == 0)
-                    {
-                        attachment.SetRevpos(generation);
+                var attachObj = new AttachmentInternal(name, attachment);
+                if(attachObj == null) {
+                    return null;
+                }
+
+                if(attachment.ContainsKey("follows") && (bool)attachment["follows"]) {
+                    try {
+                        InstallAttachment(attachObj, attachment);
+                    } catch(Exception) {
+                        return null;
                     }
-                    else
-                    {
-                        if (attachment.GetRevpos() > generation)
-                        {
-                            Log.W(Tag, string.Format("Attachment {0} {1} has unexpected revpos {2}, setting to {3}", rev, name, attachment.GetRevpos(), generation));
-                            attachment.SetRevpos(generation);
+                } else if(attachment.ContainsKey("stub") && (bool)attachment["stub"]) {
+                    if(parentAttachments == null && prevRevId != null) {
+                        parentAttachments = AttachmentsForDocId(rev.GetDocId(), prevRevId);
+                        if(parentAttachments == null) {
+                            return null;
                         }
                     }
-                    // Finally insert the attachment:
-                    InsertAttachmentForSequence(attachment, newSequence);
+
+                    return parentAttachments.Get(name).AsDictionary<string, object>();
                 }
-                else
+
+                if(attachObj.GetRevpos() == 0) {
+                    attachObj.SetRevpos(generation);
+                } else if(attachObj.GetRevpos() >= generation) {
+                    return null;
+                }
+                Debug.Assert(attachObj.IsValid());
+                return new Dictionary<string, object>
                 {
-                    // It's just a stub, so copy the previous revision's attachment entry:
-                    //? Should I enforce that the type and digest (if any) match?
-                    CopyAttachmentNamedFromSequenceToSequence(name, parentSequence, newSequence);
-                }
-            }
+                    {"stub", true},
+                    {AttachmentMetadataKeys.Digest, attachObj.GetBlobKey().Base64Digest()},
+                    {AttachmentMetadataKeys.ContentType, attachObj.GetContentType()},
+                    {"revpos", attachObj.GetRevpos()},
+                    {AttachmentMetadataKeys.Length, attachObj.GetLength()}
+                };
+            });*/
         }
 
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void CopyAttachmentNamedFromSequenceToSequence(string name, long fromSeq, long toSeq)
+        internal IDictionary<string, object> AttachmentsForDocId(string docId, string revId)
         {
-            Debug.Assert((name != null));
-            Debug.Assert((toSeq > 0));
+            var rev = new RevisionInternal(docId, revId, false);
+            LoadRevisionBody(rev, DocumentContentOptions.None);
 
-            if (fromSeq < 0)
-            {
-                throw new CouchbaseLiteException(StatusCode.NotFound);
-            }
-
-            Cursor cursor = null;
-            var args = new [] { Convert.ToString(toSeq), name, Convert.ToString(fromSeq), name };
-
-            try
-            {
-                StorageEngine.ExecSQL("INSERT INTO attachments (sequence, filename, key, type, length, revpos) "
-                    + "SELECT ?, ?, key, type, length, revpos FROM attachments " + "WHERE sequence=? AND filename=?;", args);
-                cursor = StorageEngine.IntransactionRawQuery("SELECT changes()");
-                cursor.MoveToNext();
-
-                int rowsUpdated = cursor.GetInt(0);
-                if (rowsUpdated == 0)
-                {
-                    // Oops. This means a glitch in our attachment-management or pull code,
-                    // or else a bug in the upstream server.
-                    Log.W(Tag, "Can't find inherited attachment " + name 
-                          + " from seq# " + Convert.ToString(fromSeq) + " to copy to " + Convert.ToString(toSeq));
-                    throw new CouchbaseLiteException(StatusCode.NotFound);
-                }
-                else
-                {
-                    return;
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error copying attachment", e);
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-        }
-
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void InsertAttachmentForSequence(AttachmentInternal attachment, long sequence)
-        {
-            InsertAttachmentForSequenceWithNameAndType(sequence, attachment.GetName(), attachment.GetContentType(), attachment.GetRevpos(), attachment.GetBlobKey());
-        }
-
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void InsertAttachmentForSequenceWithNameAndType(InputStream contentStream, long sequence, string name, string contentType, int revpos)
-        {
-            Debug.Assert((sequence > 0));
-            Debug.Assert((name != null));
-
-            BlobKey key;
-            if (!Attachments.StoreBlobStream(contentStream, out key))
-            {
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
-            InsertAttachmentForSequenceWithNameAndType(sequence, name, contentType, revpos, key);
-        }
-
-        /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
-        internal void InsertAttachmentForSequenceWithNameAndType(long sequence, string name, string contentType, int revpos, BlobKey key)
-        {
-            try
-            {
-                var args = new ContentValues(); // TODO: Create Add override and refactor to use initializer syntax.
-                args["sequence"] = sequence;
-                args["filename"] = name;
-                if (key != null)
-                {
-                    args.Put("key", key.GetBytes());
-                    args.Put("length", Attachments.GetSizeOfBlob(key));
-                }
-                args["type"] = contentType;
-                args["revpos"] = revpos;
-                var result = StorageEngine.Insert("attachments", null, args);
-                if (result == -1)
-                {
-                    var msg = "Insert attachment failed (returned -1)";
-                    Log.E(Tag, msg);
-                    throw new CouchbaseLiteException(msg, StatusCode.InternalServerError);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error inserting attachment", e);
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
+            return rev.GetPropertyForKey("_attachments").AsDictionary<string, object>();
         }
 
         /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
         internal void InstallAttachment(AttachmentInternal attachment, IDictionary<String, Object> attachInfo)
         {
             var digest = (string)attachInfo.Get("digest");
-            if (digest == null)
-            {
+            if(digest == null) {
                 throw new CouchbaseLiteException(StatusCode.BadAttachment);
             }
 
-            if (PendingAttachmentsByDigest != null && PendingAttachmentsByDigest.ContainsKey(digest))
-            {
+            if(PendingAttachmentsByDigest != null && PendingAttachmentsByDigest.ContainsKey(digest)) {
                 var writer = PendingAttachmentsByDigest.Get(digest);
-                try
-                {
+                try {
                     var blobStoreWriter = writer;
                     blobStoreWriter.Install();
                     attachment.SetBlobKey(blobStoreWriter.GetBlobKey());
                     attachment.SetLength(blobStoreWriter.GetLength());
-                }
-                catch (Exception e)
-                {
+                } catch(Exception e) {
                     throw new CouchbaseLiteException(e, StatusCode.StatusAttachmentError);
                 }
             }
-        }
-
-        internal Int64 InsertRevision(RevisionInternal rev, long docNumericID, long parentSequence, bool current, bool hasAttachments, IEnumerable<byte> data)
-        {
-            var rowId = 0L;
-            try
-            {
-                if (docNumericID == -1L)
-                {
-                    throw new CouchbaseLiteException(StatusCode.BadRequest);
-                }
-
-                var args = new ContentValues();
-                args["doc_id"] = docNumericID;
-                args.Put("revid", rev.GetRevId());
-                if (parentSequence != 0)
-                {
-                    args["parent"] = parentSequence;
-                }
-
-                args["current"] = current;
-                args["deleted"] = rev.IsDeleted();
-                args["no_attachments"] = !hasAttachments;
-                if (data != null)
-                {
-                    args["json"] = data.ToArray();
-                }
-
-                rowId = StorageEngine.Insert("revs", null, args);
-                rev.SetSequence(rowId);
-            }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error inserting revision", e);
-            }
-            return rowId;
         }
 
         internal void StubOutAttachmentsInRevision(IDictionary<String, AttachmentInternal> attachments, RevisionInternal rev)
@@ -4066,164 +1671,24 @@ PRAGMA user_version = 3;";
             return string.Format("{0}-{1}", generationIncremented, digestAsHex).ToLower();
         }
 
-        internal IList<String> GetPossibleAncestorRevisionIDs(RevisionInternal rev, int limit, ref Boolean hasAttachment)
-        {
-            var matchingRevs = new List<String>();
-            var generation = rev.GetGeneration();
-            if (generation <= 1)
-            {
-                return null;
-            }
-
-            var docNumericID = GetDocNumericID(rev.GetDocId());
-            if (docNumericID <= 0)
-            {
-                return null;
-            }
-
-            var sqlLimit = limit > 0 ? limit : -1;
-
-            // SQL uses -1, not 0, to denote 'no limit'
-            var sql = @"SELECT revid, sequence FROM revs WHERE doc_id=? and revid < ? and deleted=0 and json not null"
-                  + " ORDER BY sequence DESC LIMIT ?";
-            var args = new [] { Convert.ToString(docNumericID), generation + "-", sqlLimit.ToString() };
-            Cursor cursor = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql, args);
-                cursor.MoveToNext();
-
-                if (!cursor.IsAfterLast())
-                {
-                    if (matchingRevs.Count == 0)
-                    {
-                        hasAttachment = SequenceHasAttachments(cursor.GetLong(1));
-                    }
-                    matchingRevs.AddItem(cursor.GetString(0));
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Database.Tag, "Error getting all revisions of document", e);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return matchingRevs;
-        }
-
-
         /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
         internal RevisionInternal LoadRevisionBody(RevisionInternal rev, DocumentContentOptions contentOptions)
         {
-            if (rev.GetBody() != null && contentOptions == DocumentContentOptions.None && rev.GetSequence() != 0)
-            {
+            if(rev.GetBody() != null && contentOptions == DocumentContentOptions.None && rev.GetSequence() != 0) {
                 return rev;
             }
 
-            if ((rev.GetDocId() == null) || (rev.GetRevId() == null))
-            {
+            if((rev.GetDocId() == null) || (rev.GetRevId() == null)) {
                 Log.E(Database.Tag, "Error loading revision body");
                 throw new CouchbaseLiteException(StatusCode.PreconditionFailed);
             }
-            Cursor cursor = null;
-            var result = new Status(StatusCode.NotFound);
-            try
-            {
-                // TODO: on ios this query is:
-                // TODO: "SELECT sequence, json FROM revs WHERE doc_id=@ AND revid=@ LIMIT 1"
-                var sql = "SELECT sequence, json FROM revs, docs WHERE revid=? AND docs.docid=? AND revs.doc_id=docs.doc_id LIMIT 1";
-                var args = new [] { rev.GetRevId(), rev.GetDocId() };
 
-                cursor = StorageEngine.RawQuery(sql, args);
-                if (cursor.MoveToNext())
-                {
-                    result.SetCode(StatusCode.Ok);
-                    rev.SetSequence(cursor.GetLong(0));
-                    ExpandStoredJSONIntoRevisionWithAttachments(cursor.GetBlob(1), rev, contentOptions);
-                }
-            }
-            catch (SQLException e)
-            {
-                Log.E(Tag, "Error loading revision body", e);
-                throw new CouchbaseLiteException(StatusCode.InternalServerError);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            if (result.GetCode() == StatusCode.NotFound)
-            {
-                throw new CouchbaseLiteException(result.GetCode());
-            }
-            return rev;
-        }
-
-        internal Int64 InsertDocumentID(String docId)
-        {
-            var rowId = -1L;
-            try
-            {
-                ContentValues args = new ContentValues();
-                args["docid"] = docId;
-                rowId = StorageEngine.InsertWithOnConflict("docs", null, args, ConflictResolutionStrategy.Ignore);
-            }
-            catch (Exception e)
-            {
-                Log.E(Tag, "Error inserting document id", e);
-            }
-            return rowId;
+            return Store.LoadRevisionBody(rev, contentOptions);
         }
 
         internal Boolean ExistsDocumentWithIDAndRev(String docId, String revId)
         {
             return GetDocumentWithIDAndRev(docId, revId, DocumentContentOptions.NoBody) != null;
-        }
-
-        /// <exception cref="Couchbase.Lite.Storage.SQLException"></exception>
-        internal Int32 FindMissingRevisions(RevisionList touchRevs)
-        {
-            var numRevisionsRemoved = 0;
-            if (touchRevs.Count == 0)
-            {
-                return numRevisionsRemoved;
-            }
-
-            var quotedDocIds = JoinQuoted(touchRevs.GetAllDocIds());
-            var quotedRevIds = JoinQuoted(touchRevs.GetAllRevIds());
-            var sql = "SELECT docid, revid FROM revs, docs " + "WHERE docid IN (" + quotedDocIds
-                         + ") AND revid in (" + quotedRevIds + ")" + " AND revs.doc_id == docs.doc_id";
-            Cursor cursor = null;
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql);
-                cursor.MoveToNext();
-                while (!cursor.IsAfterLast())
-                {
-                    var rev = touchRevs.RevWithDocIdAndRevId(cursor.GetString(0), cursor.GetString(1));
-                    if (rev != null)
-                    {
-                        touchRevs.Remove(rev);
-                        numRevisionsRemoved += 1;
-                    }
-                    cursor.MoveToNext();
-                }
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-            return numRevisionsRemoved;
         }
 
         /// <summary>DOCUMENT & REV IDS:</summary>
@@ -4353,40 +1818,20 @@ PRAGMA user_version = 3;";
         /// <exception cref="Couchbase.Lite.CouchbaseLiteException"></exception>
         internal void ValidateRevision(RevisionInternal newRev, RevisionInternal oldRev, String parentRevId)
         {
-            if (_validations == null || _validations.Count == 0)
-            {
+            if(_validations == null || _validations.Count == 0) {
                 return;
             }
 
             var publicRev = new SavedRevision(this, newRev);
             publicRev.ParentRevisionID = parentRevId;
             var context = new ValidationContext(this, oldRev, newRev);
-            foreach (var validationName in _validations.Keys)
-            {
+            foreach(var validationName in _validations.Keys) {
                 var validation = GetValidation(validationName);
                 validation(publicRev, context);
-                if (context.RejectMessage != null)
-                {
+                if(context.RejectMessage != null) {
                     throw new CouchbaseLiteException(context.RejectMessage, StatusCode.Forbidden);
                 }
             }
-        }
-
-        internal Boolean Initialize(String statements)
-        {
-            try
-            {
-                foreach (string statement in statements.Split(new[] { ";" }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    StorageEngine.ExecSQL(statement);
-                }
-            }
-            catch (SQLException)
-            {
-                Close();
-                return false;
-            }
-            return true;
         }
 
         internal String AttachmentStorePath 
@@ -4404,254 +1849,46 @@ PRAGMA user_version = 3;";
             }
         }
 
+        //TODO.JHB: After ForestDB implementation, check for existing Sqlite
         internal Boolean Open()
         {
-            if (_isOpen)
-            {
-                return true;
-            }
-
-            // Create the storage engine.
-            StorageEngine = SQLiteStorageEngineFactory.CreateStorageEngine();
-
-            // Try to open the storage engine and stop if we fail.
-            if (StorageEngine == null || !StorageEngine.Open(Path))
-            {
-                var msg = "Unable to create a storage engine, fatal error";
-                Log.E(Tag, msg);
-                throw new CouchbaseLiteException(msg);
-            }
-
-            // Stuff we need to initialize every time the sqliteDb opens:
-            if (!Initialize("PRAGMA foreign_keys = ON; PRAGMA journal_mode=WAL;"))
-            {
-                Log.E(Tag, "Error turning on foreign keys");
+            string storageType = Manager.StorageType ?? "Sqlite";
+            Store = CouchStoreFactory.GetCouchStore(storageType); 
+            Store.Delegate = this;
+            if(!Store.Open(Path, _readOnly, Manager)) {
                 return false;
             }
 
-            // Check the user_version number we last stored in the sqliteDb:
-            var dbVersion = StorageEngine.GetVersion();
-
-            // Incompatible version changes increment the hundreds' place:
-            if (dbVersion >= 100)
-            {
-                Log.E(Tag, "Database: Database version (" + dbVersion + ") is newer than I know how to work with");
-                StorageEngine.Close();
-                return false;
-            }
-
-            if (dbVersion < 1)
-            {
-                // First-time initialization:
-                // (Note: Declaring revs.sequence as AUTOINCREMENT means the values will always be
-                // monotonically increasing, never reused. See <http://www.sqlite.org/autoinc.html>)
-                if (!Initialize(Schema))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-
-                dbVersion = 3;
-            }
-
-            if (dbVersion < 2)
-            {
-                // Version 2: added attachments.revpos
-                var upgradeSql = "ALTER TABLE attachments ADD COLUMN revpos INTEGER DEFAULT 0; PRAGMA user_version = 2";
-
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 2;
-            }
-
-            if (dbVersion < 3)
-            {
-                var upgradeSql = "CREATE TABLE localdocs ( " + "docid TEXT UNIQUE NOT NULL, " 
-                                    + "revid TEXT NOT NULL, " + "json BLOB); " + "CREATE INDEX localdocs_by_docid ON localdocs(docid); "
-                                    + "PRAGMA user_version = 3";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 3;
-            }
-
-            if (dbVersion < 4)
-            {
-                var upgradeSql = "CREATE TABLE info ( " + "key TEXT PRIMARY KEY, " + "value TEXT); "
-                                    + "INSERT INTO INFO (key, value) VALUES ('privateUUID', '" + Misc.CreateGUID(
-                                       ) + "'); " + "INSERT INTO INFO (key, value) VALUES ('publicUUID',  '" + Misc.CreateGUID
-                                    () + "'); " + "PRAGMA user_version = 4";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 4;
-            }
-            if (dbVersion < 5)
-            {
-                // Version 5: added encoding for attachments
-                var upgradeSql = "ALTER TABLE attachments ADD COLUMN encoding INTEGER DEFAULT 0; "
-                    + "ALTER TABLE attachments ADD COLUMN encoded_length INTEGER; " + "PRAGMA user_version = 5";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 5;
-            }
-            if (dbVersion < 6)
-            {
-                // Version 6: enable Write-Ahead Log (WAL) <http://sqlite.org/wal.html>
-                // Not supported on Android, require SQLite 3.7.0
-                //String upgradeSql  = "PRAGMA journal_mode=WAL; " +
-                var upgradeSql = "PRAGMA user_version = 6";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 6;
-            }
-            if (dbVersion < 7)
-            {
-                // Version 7: enable full-text search
-                // Note: Apple's SQLite build does not support the icu or unicode61 tokenizers :(
-                // OPT: Could add compress/decompress functions to make stored content smaller
-                // Not supported on Android
-                //String upgradeSql = "CREATE VIRTUAL TABLE fulltext USING fts4(content, tokenize=unicodesn); " +
-                //"ALTER TABLE maps ADD COLUMN fulltext_id INTEGER; " +
-                //"CREATE INDEX IF NOT EXISTS maps_by_fulltext ON maps(fulltext_id); " +
-                //"CREATE TRIGGER del_fulltext DELETE ON maps WHEN old.fulltext_id not null " +
-                //"BEGIN DELETE FROM fulltext WHERE rowid=old.fulltext_id| END; " +
-                var upgradeSql = "PRAGMA user_version = 7";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 7;
-            }
-            // (Version 8 was an older version of the geo index)
-            if (dbVersion < 9)
-            {
-                // Version 9: Add geo-query index
-                //String upgradeSql = "CREATE VIRTUAL TABLE bboxes USING rtree(rowid, x0, x1, y0, y1); " +
-                //"ALTER TABLE maps ADD COLUMN bbox_id INTEGER; " +
-                //"ALTER TABLE maps ADD COLUMN geokey BLOB; " +
-                //"CREATE TRIGGER del_bbox DELETE ON maps WHEN old.bbox_id not null " +
-                //"BEGIN DELETE FROM bboxes WHERE rowid=old.bbox_id| END; " +
-                var upgradeSql = "PRAGMA user_version = 9";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 9;
-            }
-            if (dbVersion < 10)
-            {
-                // Version 10: Add rev flag for whether it has an attachment
-                var upgradeSql = "ALTER TABLE revs ADD COLUMN no_attachments BOOLEAN; " + "PRAGMA user_version = 10";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 10;
-            }
-
-            // (Version 11 used to create the index revs_cur_deleted, which is obsoleted in version 16)
-            
-            if (dbVersion < 14)
-            {
-                // Version 14: Add index for getting a document with doc and rev id
-                var upgradeSql = "CREATE INDEX IF NOT EXISTS revs_by_docid_revid ON revs(doc_id, revid desc, current, deleted); " +
-                    "PRAGMA user_version = 14";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 14;
-            }
-            if (dbVersion < 15)
-            {
-                // Version 15: Add sequence index on maps and attachments for revs(sequence) on DELETE CASCADE
-                var upgradeSql = "CREATE INDEX maps_sequence ON maps(sequence);  " +
-                                 "CREATE INDEX attachments_sequence ON attachments(sequence); " +
-                    "PRAGMA user_version = 15";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 15;
-            }
-            if (dbVersion < 16)
-            {
-                // Version 16: Fix the very suboptimal index revs_cur_deleted.
-                // The new revs_current is an optimal index for finding the winning revision of a doc.
-                var upgradeSql = "DROP INDEX IF EXISTS revs_current; " +
-                                 "DROP INDEX IF EXISTS revs_cur_deleted; " +
-                                 "CREATE INDEX revs_current ON revs(doc_id, current desc, deleted, revid desc); " +
-                    "PRAGMA user_version = 16";
-                if (!Initialize(upgradeSql))
-                {
-                    StorageEngine.Close();
-                    return false;
-                }
-                dbVersion = 16;
-            }
-
-            try
-            {
+            try {
                 Attachments = new BlobStore(AttachmentStorePath);
-            }
-            catch (ArgumentException e)
-            {
+            } catch(ArgumentException e) {
                 Log.E(Tag, "Could not initialize attachment store", e);
-                StorageEngine.Close();
+                Store.Close();
                 return false;
             }
-
-            _isOpen = true;
-
+                
             return true;
         }
 
         internal Boolean Close()
         {
-            if (StorageEngine != null && StorageEngine.IsOpen)
-            {
-                StorageEngine.Close();
-            }
-
-            if (!_isOpen)
-            {
+            if(!_isOpen) {
                 return false;
             }
+
             Log.I(Tag, "Closing database {0}", Name);
-            if (_views != null)
-            {
-                foreach (View view in _views.Values)
-                {
+            if(_views != null) {
+                foreach(View view in _views.Values) {
                     view.DatabaseClosing();
                 }
             }
+
             _views = null;
-            if (ActiveReplicators != null)
-            {
+            if(ActiveReplicators != null) {
                 // 
                 var activeReplicators = new Replication[ActiveReplicators.Count];
                 ActiveReplicators.CopyTo(activeReplicators, 0);
-                foreach (Replication replicator in activeReplicators)
-                {
+                foreach(Replication replicator in activeReplicators) {
                     replicator.DatabaseClosing();
                 }
                 ActiveReplicators = null;
@@ -4659,6 +1896,8 @@ PRAGMA user_version = 3;";
 
             _isOpen = false;
             _transactionLevel = 0;
+            Store.Close();
+            Store = null;
             return true;
         }
 
@@ -4684,78 +1923,65 @@ PRAGMA user_version = 3;";
             };
         }
 
-        internal int PruneRevsToMaxDepth(int maxDepth)
-        {
-            int outPruned = 0;
-            IDictionary<long, int> toPrune = new Dictionary<long, int>();
+    #endregion
 
-            if (maxDepth == 0)
-            {
-                maxDepth = MaxRevTreeDepth;
+        #region IStoreDelegate
+
+        public SymmetricKey EncryptionKey {
+            get {
+                return null;
             }
-
-            // First find which docs need pruning, and by how much:
-            Cursor cursor = null;
-            const string sql = "SELECT doc_id, MIN(revid), MAX(revid) FROM revs GROUP BY doc_id";
-            long docNumericID = -1;
-            var minGen = 0;
-            var maxGen = 0;
-
-            try
-            {
-                cursor = StorageEngine.RawQuery(sql);
-
-                while (cursor.MoveToNext())
-                {
-                    docNumericID = cursor.GetLong(0);
-
-                    var minGenRevId = cursor.GetString(1);
-                    var maxGenRevId = cursor.GetString(2);
-
-                    minGen = RevisionInternal.GenerationFromRevID(minGenRevId);
-                    maxGen = RevisionInternal.GenerationFromRevID(maxGenRevId);
-
-                    if ((maxGen - minGen + 1) > maxDepth)
-                    {
-                        toPrune.Put(docNumericID, (maxGen - minGen));
-                    }
-                }
-
-                if (toPrune.Count == 0)
-                {
-                    return 0;
-                }
-
-                RunInTransaction(() =>
-                {
-                    foreach (long id in toPrune.Keys)
-                    {
-                        var minIDToKeep = String.Format("{0}-", (toPrune.Get(id) + 1));
-                        var deleteArgs = new string[] { System.Convert.ToString(docNumericID), minIDToKeep };
-                        var rowsDeleted = StorageEngine.Delete("revs", "doc_id=? AND revid < ? AND current=0", deleteArgs);
-                        outPruned += rowsDeleted;
-                    }
-
-                    return true;
-                });
-            }
-            catch (Exception e)
-            {
-                throw new CouchbaseLiteException(e, StatusCode.InternalServerError);
-            }
-            finally
-            {
-                if (cursor != null)
-                {
-                    cursor.Close();
-                }
-            }
-
-            return outPruned;
         }
 
+        public string GenerateRevID(IEnumerable<byte> json, bool deleted, string prevRevId)
+        {
+            // Revision IDs have a generation count, a hyphen, and a hex digest.
+            int generation = 0;
+            if(prevRevId != null) {
+                generation = RevisionInternal.GenerationFromRevID(prevRevId);
+                if(generation == 0) {
+                    return null;
+                }
+            }
 
-    #endregion
+            // Generate a digest for this revision based on the previous revision ID, document JSON,
+            // and attachment digests. This doesn't need to be secure; we just need to ensure that this
+            // code consistently generates the same ID given equivalent revisions.
+            MessageDigest md5digest = MessageDigest.GetInstance("MD5");
+
+            var prevBytes = Encoding.UTF8.GetBytes(prevRevId);
+            var length = prevBytes.Length;
+            byte lengthByte = (byte)(prevBytes.Length & 0xFF);
+            md5digest.Update(lengthByte);
+            if(length > 0) {
+                md5digest.Update(prevBytes);
+            }
+
+            byte deletedByte = deleted ? (byte)1 : (byte)0;
+            md5digest.Update(deletedByte);
+            md5digest.Update(json.ToArray());
+            var digestBytes = md5digest.Digest();
+
+            StringBuilder sb = new StringBuilder();
+            sb.AppendFormat("{0}-", generation + 1);
+            foreach(byte b in digestBytes) {
+                sb.AppendFormat("{0:x2}", b);
+            }
+
+            return sb.ToString();
+        }
+
+        public void DatabaseStorageChanged(DocumentChange change)
+        {
+
+        }
+
+        public void StorageExitedTransaction(bool committed)
+        {
+
+        }
+
+        #endregion
     
     }
 

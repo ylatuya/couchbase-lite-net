@@ -47,13 +47,17 @@ using System.Collections.Generic;
 using System.Net;
 using System.IO;
 using Sharpen;
+using Couchbase.Lite.Internal;
 
 namespace Couchbase.Lite 
 {
+
+    internal delegate bool RevisionFilterDelegate(RevisionInternal rev);
+
     /// <summary>
     /// A Couchbase Lite Document Revision.
     /// </summary>
-    public abstract partial class Revision 
+    public abstract class Revision 
     {
     
     #region Constructors
@@ -63,7 +67,7 @@ namespace Couchbase.Lite
         /// <summary>Constructor</summary>
         protected internal Revision(Document document)
         {
-            this.Document = document;
+            Document = document;
         }
 
     #endregion

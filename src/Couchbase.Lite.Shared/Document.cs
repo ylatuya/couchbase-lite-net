@@ -231,7 +231,7 @@ namespace Couchbase.Lite {
             var docsToRevs = new Dictionary<String, IList<String>>();
             docsToRevs[Id] = revs;
 
-            Database.PurgeRevisions(docsToRevs);
+            Database.Store.PurgeRevisions(docsToRevs);
             Database.RemoveDocumentFromCache(this);
         }
 
@@ -466,7 +466,7 @@ namespace Couchbase.Lite {
         internal IList<SavedRevision> GetLeafRevisions(bool includeDeleted)
         {
             var result = new List<SavedRevision>();
-            var revs = Database.GetAllRevisionsOfDocumentID(Id, true);
+            var revs = Database.Store.GetAllDocumentRevisions(Id, true);
             foreach (RevisionInternal rev in revs)
             {
                 // add it to result, unless we are not supposed to include deleted and it's deleted

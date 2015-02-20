@@ -105,8 +105,7 @@ namespace Couchbase.Lite
         /// <param name="name">The Database name to validate.</param>
         public static Boolean IsValidDatabaseName(String name) 
         {
-            if (name.Length > 0 && name.Length < 240 && ContainsOnlyLegalCharacters(name) && Char.IsLower(name[0]))
-            {
+            if(name.Length > 0 && name.Length < 240 && ContainsOnlyLegalCharacters(name) && Char.IsLower(name[0])) {
                 return true;
             }
             return name.Equals(Replication.ReplicatorDatabaseName);
@@ -152,6 +151,7 @@ namespace Couchbase.Lite
             this.options = options ?? DefaultOptions;
             this.databases = new Dictionary<string, Database>();
             this.replications = new List<Replication>();
+            this.StorageType = "Sqlite";
 
             //create the directory, but don't fail if it already exists
             if (!directoryFile.Exists)
@@ -207,7 +207,9 @@ namespace Couchbase.Lite
             }
         }
 
-        //Methods
+        //"Sqlite", the default, or "ForestDB" once it is implemented
+        internal string StorageType { get; private set; }
+
         /// <summary>
         /// Releases all resources used by the <see cref="Couchbase.Lite.Manager"/> and closes all its <see cref="Couchbase.Lite.Database"/>s.
         /// </summary>

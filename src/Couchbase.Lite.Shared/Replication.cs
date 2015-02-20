@@ -516,9 +516,8 @@ namespace Couchbase.Lite
         internal void ClearDbRef()
         {
             Log.D(Tag, "ClearDbRef...");
-            if (LocalDatabase != null && savingCheckpoint && LastSequence != null)
-            {
-                LocalDatabase.SetLastSequence(LastSequence, RemoteCheckpointDocID(), !IsPull);
+            if(LocalDatabase != null && savingCheckpoint && LastSequence != null) {
+                LocalDatabase.SetLastSequence(LastSequence, RemoteCheckpointDocID());
                 LocalDatabase = null;
             }
         }
@@ -878,7 +877,7 @@ namespace Couchbase.Lite
                     var response = ((JObject)result).ToObject<IDictionary<string, object>>();
                     body.Put ("_rev", response.Get ("rev"));
                     remoteCheckpoint = body;
-                    LocalDatabase.SetLastSequence(LastSequence, RemoteCheckpointDocID(), !IsPull);
+                    LocalDatabase.SetLastSequence(LastSequence, RemoteCheckpointDocID());
                 }
 
                 if (overdueForSave) {

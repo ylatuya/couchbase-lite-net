@@ -748,7 +748,7 @@ namespace Couchbase.Lite.Replicator
                 return;
             }
 
-            if (knownRevs.Count > 0)
+            if (knownRevs.Count() > 0)
             {
                 path.Append("&atts_since=");
                 path.Append(JoinQuotedEscaped(knownRevs));
@@ -897,7 +897,7 @@ namespace Couchbase.Lite.Replicator
             }
         }
 
-        private IList<String> KnownCurrentRevIDs(RevisionInternal rev)
+        private IEnumerable<String> KnownCurrentRevIDs(RevisionInternal rev)
         {
             if (LocalDatabase != null)
             {
@@ -906,9 +906,9 @@ namespace Couchbase.Lite.Replicator
             return null;
         }
 
-        public string JoinQuotedEscaped(IList<string> strings)
+        public string JoinQuotedEscaped(IEnumerable<string> strings)
         {
-            if (strings.Count == 0)
+            if (!strings.Any())
             {
                 return "[]";
             }

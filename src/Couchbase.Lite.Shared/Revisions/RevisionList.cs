@@ -42,8 +42,8 @@
 
 using System.Collections.Generic;
 using Couchbase.Lite;
+using System.Linq;
 using Couchbase.Lite.Internal;
-using Sharpen;
 
 namespace Couchbase.Lite
 {
@@ -51,7 +51,7 @@ namespace Couchbase.Lite
     [System.Serializable]
     internal class RevisionList : List<RevisionInternal>
     {
-        public RevisionList() : base()
+        public RevisionList()
         {
         }
 
@@ -63,57 +63,28 @@ namespace Couchbase.Lite
 
         public virtual RevisionInternal RevWithDocIdAndRevId(string docId, string revId)
         {
-            IEnumerator<RevisionInternal> iterator = GetEnumerator();
-            while (iterator.MoveNext())
-            {
-                var rev = iterator.Current;
-                if (docId.Equals(rev.GetDocId()) && revId.Equals(rev.GetRevId()))
-                {
-                    return rev;
-                }
-            }
-            return null;
+            var query = from rev in this
+                                 where (docId.Equals(rev.GetDocId()) && revId.Equals(rev.GetRevId()))
+                                 select rev;
+
+            return query.FirstOrDefault();
         }
 
-        public virtual IList<string> GetAllDocIds()
+        public virtual IEnumerable<string> GetAllDocIds()
         {
-            IList<string> result = new List<string>();
-            IEnumerator<RevisionInternal> iterator = GetEnumerator();
-            while (iterator.MoveNext())
-            {
-                RevisionInternal rev = iterator.Current;
-                result.AddItem(rev.GetDocId());
-            }
-            return result;
+            return from rev in this
+                            select rev.GetDocId();
         }
 
-        public virtual IList<string> GetAllRevIds()
+        public virtual IEnumerable<string> GetAllRevIds()
         {
-            IList<string> result = new List<string>();
-            IEnumerator<RevisionInternal> iterator = GetEnumerator();
-            while (iterator.MoveNext())
-            {
-                RevisionInternal rev = iterator.Current;
-                result.AddItem(rev.GetRevId());
-            }
-            return result;
+            return from rev in this
+                            select rev.GetRevId();
         }
 
         public virtual void SortBySequence()
         {
-            this.Sort(new _IComparer_82());
-        }
-
-        private sealed class _IComparer_82 : IComparer<RevisionInternal>
-        {
-            public _IComparer_82()
-            {
-            }
-
-            public int Compare(RevisionInternal rev1, RevisionInternal rev2)
-            {
-                return Misc.TDSequenceCompare(rev1.GetSequence(), rev2.GetSequence());
-            }
+            Sort(new RevisionComparer());
         }
 
         public virtual void Limit(int limit)
@@ -121,6 +92,14 @@ namespace Couchbase.Lite
             if (Count > limit)
             {
                 RemoveRange(limit, Count);
+            }
+        }
+
+        private sealed class RevisionComparer : IComparer<RevisionInternal>
+        {
+            public int Compare(RevisionInternal rev1, RevisionInternal rev2)
+            {
+                return Misc.TDSequenceCompare(rev1.GetSequence(), rev2.GetSequence());
             }
         }
     }
