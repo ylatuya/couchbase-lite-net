@@ -31,7 +31,6 @@ namespace Couchbase.Lite.Listener
         {
             // Manage configurations
             Get["/{db}"] = DatabaseMethods.GetConfiguration;
-            Post["/{db}"] = DatabaseMethods.ExecuteTemporaryViewFunction;
             Put["/{db}"] = DatabaseMethods.UpdateConfiguration;
             Delete["/{db}"] = DatabaseMethods.DeleteConfiguration;
 
