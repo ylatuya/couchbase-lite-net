@@ -793,7 +793,7 @@ CREATE TABLE maps (
   view_id INTEGER NOT NULL REFERENCES views(view_id) ON DELETE CASCADE, 
   sequence INTEGER NOT NULL REFERENCES revs(sequence) ON DELETE CASCADE, 
   key TEXT NOT NULL COLLATE JSON, 
-  value TEXT); 
+  value TEXT);
 CREATE INDEX maps_keys on maps(view_id, key COLLATE JSON); 
 CREATE TABLE replicators ( 
   remote TEXT NOT NULL, 
@@ -4363,13 +4363,17 @@ PRAGMA user_version = 3;";
             }
         }
 
-        internal Boolean Initialize(String statements)
+        internal Boolean Initialize(String statements, bool split=false)
         {
             try
             {
-                foreach (string statement in statements.Split(new[] { ";" }, StringSplitOptions.RemoveEmptyEntries))
-                {
-                    StorageEngine.ExecSQL(statement);
+                if (split) {
+                    foreach (string statement in statements.Split(new[] { ";" }, StringSplitOptions.RemoveEmptyEntries))
+                    {
+                        StorageEngine.ExecSQL(statement);
+                    }
+                } else {
+                    StorageEngine.ExecSQL(statements);
                 }
             }
             catch (SQLException)
@@ -4483,15 +4487,17 @@ PRAGMA user_version = 3;";
                 // Version 7: enable full-text search
                 // Note: Apple's SQLite build does not support the icu or unicode61 tokenizers :(
                 // OPT: Could add compress/decompress functions to make stored content smaller
-                // Not supported on Android
-                //String upgradeSql = "CREATE VIRTUAL TABLE fulltext USING fts4(content, tokenize=unicodesn); " +
-                //"ALTER TABLE maps ADD COLUMN fulltext_id INTEGER; " +
-                //"CREATE INDEX IF NOT EXISTS maps_by_fulltext ON maps(fulltext_id); " +
-                //"CREATE TRIGGER del_fulltext DELETE ON maps WHEN old.fulltext_id not null " +
-                //"BEGIN DELETE FROM fulltext WHERE rowid=old.fulltext_id| END; " +
-                var upgradeSql = "PRAGMA user_version = 7";
-                if (!Initialize(upgradeSql))
-                {
+                String upgradeSql = "CREATE VIRTUAL TABLE fulltext USING fts4(content); " +
+                "ALTER TABLE maps ADD COLUMN fulltext_id INTEGER; " +
+                "CREATE INDEX IF NOT EXISTS maps_by_fulltext ON maps(fulltext_id); " +
+                "PRAGMA user_version = 7";
+                if (!Initialize(upgradeSql)) {
+                    StorageEngine.Close();
+                    return false;
+                }
+                string trigger  = "CREATE TRIGGER del_fulltext DELETE ON maps WHEN old.fulltext_id not null " +
+                    "BEGIN DELETE FROM fulltext WHERE rowid=old.fulltext_id; END;";
+                if (!Initialize(trigger, false)) {
                     StorageEngine.Close();
                     return false;
                 }
